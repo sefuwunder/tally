@@ -47,7 +47,24 @@ export async function parseJsonBody(req: Request): Promise<
   return { ok: true, body: body as Record<string, unknown> };
 }
 
-/** Wrap a handler: require a live session (401 unauthorized / session_expired). */
+/** Lenient variant: an empty body parses as {} (for POSTs with no payload). */
+export async function parseJsonBodyLenient(req: Request): Promise<
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response }
+> {
+  const text = await req.text();
+  if (!text.trim()) return { ok: true, body: {} };
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return { ok: false, response: errorResponse("validation", "request body must be valid JSON", 400) };
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, response: errorResponse("validation", "request body must be a JSON object", 400) };
+  }
+  return { ok: true, body: body as Record<string, unknown> };
+}
 export function withAuth(db: Database, cfg: SessionConfig, handler: Handler): Handler {
   return (req) => {
     const auth = authenticate(db, getBearerToken(req), cfg);

@@ -40,11 +40,12 @@ bun src/cli.ts serve            # port 3041, or TALLY_PORT / --port
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0 surface)
+## API (Phase 0–1 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
-`invalid_credentials`, `account_locked`, `not_found`).
+`invalid_credentials`, `account_locked`, `not_found`, `unbalanced`,
+`period_closed`, `already_reversed`, `in_use`, `overlap`, `no_open_period`).
 
 ```
 POST /api/v1/auth/login { email, password } -> { token, expires_at, must_change_password }
@@ -52,6 +53,21 @@ POST /api/v1/auth/logout                        (Bearer)
 GET  /api/v1/auth/me                            (Bearer)
 GET  /api/v1/compliance/audit-log               (Bearer; roles with audit:read)
      ?action= &entity_type= &actor_id= &since= &until= &page= &per_page= &verify=1
+GET  /api/v1/ledger/accounts                     (Bearer; ledger:read)
+POST /api/v1/ledger/accounts { code, name, type, parent_id? }   (ledger:write)
+GET  /api/v1/ledger/accounts/:id                 (ledger:read)
+PATCH /api/v1/ledger/accounts/:id { name }       (ledger:write)
+DELETE /api/v1/ledger/accounts/:id               (ledger:write; soft-delete, blocked while in use)
+GET  /api/v1/ledger/accounts/:id/ledger          (ledger:read; ?period_id= &from= &to=)
+POST /api/v1/ledger/journal { memo, lines, period_id?, posted_on? }  (ledger:post; Idempotency-Key honored)
+GET  /api/v1/ledger/journal                      (ledger:read; ?period_id= &page= &per_page=)
+GET  /api/v1/ledger/journal/:id                  (ledger:read)
+POST /api/v1/ledger/journal/:id/reverse { memo?, posted_on?, period_id? }  (ledger:post)
+GET  /api/v1/ledger/periods                      (ledger:read)
+POST /api/v1/ledger/periods { name, starts_on, ends_on }   (ledger:write)
+POST /api/v1/ledger/periods/:id/close            (ledger:approve; trial-balance gate)
+POST /api/v1/ledger/periods/:id/reopen           (ledger:admin; audited)
+GET  /api/v1/ledger/trial-balance?period_id=     (ledger:read)
 GET  /health
 ```
 
@@ -69,6 +85,13 @@ row (`hash = sha256(prev_hash || canonical JSON)`); DB triggers reject
 UPDATE/DELETE on the log; `?verify=1` recomputes the chain server-side.
 Secrets (passwords, tokens, keys) are never written to the log.
 
+Ledger: the only path to GL writes is `postJournal()` — balanced, integer
+cents, open-period check; posted entries are immutable at the DB level
+(triggers reject UPDATE/DELETE); corrections post reversing entries via
+`reverseJournal()` (swapped debits/credits, `reversed_by` on the new entry).
+Period close runs a trial-balance gate; reopening requires `ledger:admin` and
+is audited. Financial mutations accept `Idempotency-Key`.
+
 Encryption: field-level AES-256-GCM via WebCrypto for designated sensitive
 columns (HR PII lands in Phase 8; the mechanism and its tests are Phase 0).
 
@@ -82,7 +105,10 @@ src/auth.ts        passwords, lockout, sessions
 src/rbac.ts        permission evaluation (permissions are seeded data)
 src/audit.ts       hash-chained append-only log + chain verification
 src/middleware.ts  JSON/errors, auth+RBAC wrappers, audited-mutation helper
-src/seed.ts        roles, RBAC matrix, admin user, retention policies
+src/ledger.ts      ledger core: postJournal/reverseJournal, accounts, periods,
+                   trial balance, account ledger, idempotency
+src/seed.ts        roles, RBAC matrix, admin user, retention policies,
+                   default chart of accounts, current-year fiscal period
 src/cli.ts         `tally serve|seed|migrate`
 migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite

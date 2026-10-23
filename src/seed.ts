@@ -77,6 +77,27 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
   },
 };
 
+/** Default chart of accounts seeded for a new company. Codes are the dedupe key. */
+export const DEFAULT_ACCOUNTS: { code: string; name: string; type: string }[] = [
+  { code: "1000", name: "Cash", type: "asset" },
+  { code: "1010", name: "Petty Cash", type: "asset" },
+  { code: "1100", name: "Accounts Receivable", type: "asset" },
+  { code: "1200", name: "Inventory", type: "asset" },
+  { code: "1500", name: "Equipment", type: "asset" },
+  { code: "2000", name: "Accounts Payable", type: "liability" },
+  { code: "2100", name: "Sales Tax Payable", type: "liability" },
+  { code: "2200", name: "Payroll Liabilities", type: "liability" },
+  { code: "3000", name: "Owner Equity", type: "equity" },
+  { code: "3100", name: "Retained Earnings", type: "equity" },
+  { code: "4000", name: "Sales Revenue", type: "revenue" },
+  { code: "4100", name: "Service Revenue", type: "revenue" },
+  { code: "5000", name: "Cost of Goods Sold", type: "expense" },
+  { code: "6000", name: "Wages Expense", type: "expense" },
+  { code: "6100", name: "Rent Expense", type: "expense" },
+  { code: "6200", name: "Office Supplies", type: "expense" },
+  { code: "6300", name: "Professional Services", type: "expense" },
+];
+
 export const ADMIN_EMAIL = "admin@example.local";
 export const ADMIN_PASSWORD = "Changeme-123456"; // must-change on first login
 
@@ -145,6 +166,24 @@ export async function seed(db: Database): Promise<void> {
       entity_type: "retention_policy",
       entity_id: "defaults",
       after: RETENTION_SEED,
+    });
+
+    // Phase 1: default chart of accounts + the current calendar-year period (open).
+    for (const a of DEFAULT_ACCOUNTS) {
+      db.query(
+        "INSERT OR IGNORE INTO accounts (code, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      ).run(a.code, a.name, a.type, now, now);
+    }
+    const year = new Date().getUTCFullYear();
+    db.query(
+      "INSERT OR IGNORE INTO fiscal_periods (name, starts_on, ends_on, created_at) VALUES (?, ?, ?, ?)",
+    ).run(`FY ${year}`, `${year}-01-01`, `${year}-12-31`, now);
+    appendAudit(db, {
+      actor_id: null,
+      action: "system.seed",
+      entity_type: "ledger_defaults",
+      entity_id: `FY ${year}`,
+      after: { accounts: DEFAULT_ACCOUNTS.length, period: `FY ${year}` },
     });
   })();
 }
