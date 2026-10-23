@@ -1,0 +1,1 @@
+{"description":"Tally ERP — self-hosted, HIPAA/FINRA-conscious ERP. Bun + zero deps + SQLite.","name":"tally","private":true,"scripts":{"migrate":"bun src/cli.ts migrate","seed":"bun src/cli.ts seed","start":"bun src/cli.ts serve","test":"bun test"},"version":"0.1.0"}

@@ -1,0 +1,150 @@
+// Tally ERP — seed.ts
+// Idempotent seed: roles, the role_permissions matrix (H-A2, least privilege),
+// the initial admin user (must-change password), and retention policies.
+// ALL seed data is synthetic — never seed real identifiers (no PHI/PII).
+
+import type { Database } from "bun:sqlite";
+import { hashPassword } from "./auth";
+import { appendAudit } from "./audit";
+import { nowIso } from "./db";
+
+/**
+ * The RBAC matrix. Default-deny: anything absent here is forbidden.
+ * auditor is read-only everywhere (separation of duties — FINRA 3110 angle).
+ */
+export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
+  admin: {
+    ledger: ["read", "write", "post", "approve", "admin"],
+    ar: ["read", "write", "post", "approve", "admin"],
+    ap: ["read", "write", "post", "approve", "admin"],
+    inventory: ["read", "write", "post", "approve", "admin"],
+    procurement: ["read", "write", "post", "approve", "admin"],
+    crm: ["read", "write", "post", "approve", "admin"],
+    hr: ["read", "write", "post", "approve", "admin"],
+    reports: ["read", "write", "post", "approve", "admin"],
+    admin: ["read", "write", "post", "approve", "admin"],
+    audit: ["read", "write", "post", "approve", "admin"],
+  },
+  accountant: {
+    ledger: ["read", "write", "post", "approve"],
+    ar: ["read", "write", "post", "approve"],
+    ap: ["read", "write", "post", "approve"],
+    inventory: ["read", "write", "post"],
+    procurement: ["read", "write"],
+    crm: ["read", "write"],
+    hr: ["read"],
+    reports: ["read", "write"],
+    audit: ["read"],
+  },
+  ap_clerk: {
+    ledger: ["read"],
+    ap: ["read", "write", "post"],
+    inventory: ["read"],
+    procurement: ["read"],
+    crm: ["read"],
+    reports: ["read"],
+  },
+  sales: {
+    ar: ["read"],
+    inventory: ["read"],
+    crm: ["read", "write"],
+    reports: ["read"],
+  },
+  hr: {
+    hr: ["read", "write", "post", "approve"],
+    reports: ["read"],
+  },
+  auditor: {
+    ledger: ["read"],
+    ar: ["read"],
+    ap: ["read"],
+    inventory: ["read"],
+    procurement: ["read"],
+    crm: ["read"],
+    hr: ["read"],
+    reports: ["read"],
+    admin: ["read"],
+    audit: ["read"],
+  },
+  viewer: {
+    ledger: ["read"],
+    ar: ["read"],
+    ap: ["read"],
+    inventory: ["read"],
+    procurement: ["read"],
+    crm: ["read"],
+    reports: ["read"],
+  },
+};
+
+export const ADMIN_EMAIL = "admin@example.local";
+export const ADMIN_PASSWORD = "Changeme-123456"; // must-change on first login
+
+/** retention_policies seed (years). H-A5: HIPAA docs 6y; F-R7: 17a-4 periods. */
+export const RETENTION_SEED: Record<string, number> = {
+  journal: 6,
+  comms: 6,
+  hr: 6,
+  audit: 6,
+};
+
+export async function seed(db: Database): Promise<void> {
+  const pwHash = await hashPassword(ADMIN_PASSWORD);
+  const now = nowIso();
+
+  db.transaction(() => {
+    for (const roleName of Object.keys(PERMISSION_MATRIX)) {
+      db.query("INSERT OR IGNORE INTO roles (name) VALUES (?)").run(roleName);
+    }
+    const roleId = (name: string) =>
+      (db.query("SELECT id FROM roles WHERE name = ?").get(name) as { id: number }).id;
+    for (const [roleName, resources] of Object.entries(PERMISSION_MATRIX)) {
+      const rid = roleId(roleName);
+      for (const [resource, actions] of Object.entries(resources)) {
+        for (const action of actions) {
+          db.query(
+            "INSERT OR IGNORE INTO role_permissions (role_id, resource, action) VALUES (?, ?, ?)",
+          ).run(rid, resource, action);
+        }
+      }
+      appendAudit(db, {
+        actor_id: null,
+        action: "system.seed",
+        entity_type: "role",
+        entity_id: roleName,
+        after: { resources: Object.keys(resources).length },
+      });
+    }
+
+    const adminRoleId = roleId("admin");
+    const existing = db.query("SELECT id FROM users WHERE email = ?").get(ADMIN_EMAIL);
+    if (!existing) {
+      db.query(
+        `INSERT INTO users
+           (email, pw_hash, role_id, must_change_pw, created_at, updated_at)
+         VALUES (?, ?, ?, 1, ?, ?)`,
+      ).run(ADMIN_EMAIL, pwHash, adminRoleId, now, now);
+      appendAudit(db, {
+        actor_id: null,
+        action: "system.seed",
+        entity_type: "user",
+        entity_id: ADMIN_EMAIL,
+        after: { role: "admin", must_change_pw: true },
+      });
+    }
+
+    for (const [entityType, years] of Object.entries(RETENTION_SEED)) {
+      db.query("INSERT OR IGNORE INTO retention_policies (entity_type, years) VALUES (?, ?)").run(
+        entityType,
+        years,
+      );
+    }
+    appendAudit(db, {
+      actor_id: null,
+      action: "system.seed",
+      entity_type: "retention_policy",
+      entity_id: "defaults",
+      after: RETENTION_SEED,
+    });
+  })();
+}
