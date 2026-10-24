@@ -14,6 +14,7 @@ export const RESOURCES = [
   "crm",
   "hr",
   "reports",
+  "documents",
   "admin",
   "audit",
 ] as const;

@@ -83,6 +83,39 @@ export async function decryptField(blob: string): Promise<string> {
   return td.decode(pt);
 }
 
+/**
+ * Encrypt raw bytes with AES-256-GCM. Returns iv(12) || ciphertext.
+ * Used by the WORM document store (ciphertext at rest, H-T4). Tampering is
+ * detected on decrypt: GCM authentication fails and the byte is flagged by
+ * `tally verify` (F-R4).
+ */
+export async function encryptBytes(plaintext: Uint8Array): Promise<Uint8Array> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv as BufferSource },
+    await dataKey(),
+    plaintext as BufferSource,
+  );
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), 12);
+  return out;
+}
+
+/**
+ * Decrypt iv(12) || ciphertext produced by encryptBytes. Throws
+ * (OperationError) on authentication failure — never return partial plaintext.
+ */
+export async function decryptBytes(blob: Uint8Array): Promise<Uint8Array> {
+  if (blob.length < 13) throw new Error("malformed encrypted bytes");
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: blob.slice(0, 12) as BufferSource },
+    await dataKey(),
+    blob.slice(12) as BufferSource,
+  );
+  return new Uint8Array(pt);
+}
+
 /** Async WebCrypto sha256 (hex). */
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {
   const data = typeof input === "string" ? te.encode(input) : input;

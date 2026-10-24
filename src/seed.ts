@@ -22,6 +22,7 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     crm: ["read", "write", "post", "approve", "admin"],
     hr: ["read", "write", "post", "approve", "admin"],
     reports: ["read", "write", "post", "approve", "admin"],
+    documents: ["read", "write", "post", "approve", "admin"],
     admin: ["read", "write", "post", "approve", "admin"],
     audit: ["read", "write", "post", "approve", "admin"],
   },
@@ -34,6 +35,7 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     crm: ["read", "write"],
     hr: ["read"],
     reports: ["read", "write"],
+    documents: ["read", "write"],
     audit: ["read"],
   },
   ap_clerk: {
@@ -43,16 +45,19 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     procurement: ["read"],
     crm: ["read"],
     reports: ["read"],
+    documents: ["read"],
   },
   sales: {
     ar: ["read"],
     inventory: ["read"],
     crm: ["read", "write"],
     reports: ["read"],
+    documents: ["read"],
   },
   hr: {
     hr: ["read", "write", "post", "approve"],
     reports: ["read"],
+    documents: ["read", "write"],
   },
   auditor: {
     ledger: ["read"],
@@ -63,6 +68,7 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     crm: ["read"],
     hr: ["read"],
     reports: ["read"],
+    documents: ["read"],
     admin: ["read"],
     audit: ["read"],
   },
@@ -74,6 +80,7 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     procurement: ["read"],
     crm: ["read"],
     reports: ["read"],
+    documents: ["read"],
   },
 };
 
@@ -107,6 +114,21 @@ export const RETENTION_SEED: Record<string, number> = {
   comms: 6,
   hr: 6,
   audit: 6,
+  document: 6,
+};
+
+/**
+ * Per-document-type retention (years), F-R7. Financial/legal records take the
+ * conservative 6y; everything else honors the >= 3y floor (CHECK in 003).
+ */
+export const DOC_RETENTION_SEED: Record<string, number> = {
+  invoice: 6,
+  statement: 6,
+  contract: 6,
+  policy: 6,
+  correspondence: 6,
+  payroll: 6,
+  other: 3,
 };
 
 export async function seed(db: Database): Promise<void> {
@@ -160,12 +182,18 @@ export async function seed(db: Database): Promise<void> {
         years,
       );
     }
+    for (const [docType, years] of Object.entries(DOC_RETENTION_SEED)) {
+      db.query("INSERT OR IGNORE INTO doc_retention_years (doc_type, years) VALUES (?, ?)").run(
+        docType,
+        years,
+      );
+    }
     appendAudit(db, {
       actor_id: null,
       action: "system.seed",
       entity_type: "retention_policy",
       entity_id: "defaults",
-      after: RETENTION_SEED,
+      after: { policies: RETENTION_SEED, document_types: DOC_RETENTION_SEED },
     });
 
     // Phase 1: default chart of accounts + the current calendar-year period (open).

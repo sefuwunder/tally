@@ -35,6 +35,19 @@ import {
   type AccountRow,
 } from "./ledger";
 import {
+  prepareDocument,
+  insertDocument,
+  getDocument,
+  listDocuments,
+  getDocumentContent,
+  deleteDocument,
+  DocumentError,
+  type DocumentMeta,
+} from "./documents";
+import { RetentionError, retentionReport } from "./retention";
+import { verifyAll, exportRecords, ComplianceError } from "./compliance";
+import { appendAudit } from "./audit";
+import {
   errorResponse,
   jsonResponse,
   getBearerToken,
@@ -167,6 +180,22 @@ function ledgerError(e: unknown): Response {
         in_use: 409,
         overlap: 409,
       }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/** Map document/retention/compliance errors to the envelope; rethrow others. */
+function documentError(e: unknown): Response {
+  if (e instanceof RetentionError) {
+    return errorResponse("retained", e.message, 405);
+  }
+  if (e instanceof DocumentError) {
+    const status = { validation: 400, not_found: 404, corrupt: 500 }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  if (e instanceof ComplianceError) {
+    const status = { validation: 400, not_found: 404 }[e.code] ?? 400;
     return errorResponse(e.code, e.message, status);
   }
   throw e;
@@ -528,6 +557,280 @@ function handleLedger(req: Request, db: Database, cfg: SessionConfig, url: URL):
   return errorResponse("not_found", "not found", 404);
 }
 
+/** Sanitize a title for Content-Disposition (no quotes/CR/LF). */
+function safeFilename(title: string): string {
+  return title.replace(/["\r\n]/g, "_").slice(0, 200) || "document";
+}
+
+/** Extract upload fields from JSON (base64) or multipart form bodies. */
+async function parseUploadBody(
+  req: Request,
+): Promise<
+  | { ok: true; title: string; doc_type: string; mime_type: string; content: Uint8Array }
+  | { ok: false; response: Response }
+> {
+  const ct = req.headers.get("content-type") ?? "";
+  try {
+    if (ct.includes("multipart/form-data")) {
+      const form = await req.formData();
+      const file = form.get("file");
+      if (!(file instanceof File)) {
+        return {
+          ok: false,
+          response: errorResponse("validation", "multipart upload requires a 'file' field", 400),
+        };
+      }
+      const title = String(form.get("title") ?? file.name ?? "").trim();
+      return {
+        ok: true,
+        title: title || "untitled",
+        doc_type: String(form.get("doc_type") ?? "other"),
+        mime_type: file.type || "application/octet-stream",
+        content: new Uint8Array(await file.arrayBuffer()),
+      };
+    }
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return parsed;
+    const b = parsed.body;
+    if (typeof b.content_base64 !== "string" || !b.content_base64) {
+      return {
+        ok: false,
+        response: errorResponse("validation", "content_base64 is required", 400),
+      };
+    }
+    let content: Uint8Array;
+    try {
+      content = new Uint8Array(Buffer.from(b.content_base64, "base64"));
+    } catch {
+      return {
+        ok: false,
+        response: errorResponse("validation", "content_base64 is not valid base64", 400),
+      };
+    }
+    return {
+      ok: true,
+      title: String(b.title ?? "untitled"),
+      doc_type: String(b.doc_type ?? "other"),
+      mime_type: typeof b.mime_type === "string" ? b.mime_type : "application/octet-stream",
+      content,
+    };
+  } catch {
+    return {
+      ok: false,
+      response: errorResponse("validation", "could not parse upload body", 400),
+    };
+  }
+}
+
+/** All /api/v1/documents/* routes (WORM store, F-R2/F-R3/F-R4). */
+function handleDocuments(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "documents", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/documents/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+
+  // --- collection ---
+  if (parts.length === 0) {
+    if (req.method === "GET") {
+      return perm("read", () => {
+        const page = parseQueryInt(url, "page", 1);
+        const per_page = parseQueryInt(url, "per_page", 50);
+        const { rows, total } = listDocuments(db, {
+          doc_type: url.searchParams.get("doc_type") ?? undefined,
+          page,
+          per_page,
+        });
+        return Response.json({ data: rows, meta: { page, per_page, total } });
+      })(req);
+    }
+    if (req.method === "POST") {
+      return perm("write", async (req2, ctx) => {
+        const up = await parseUploadBody(req2);
+        if (!up.ok) return up.response;
+        try {
+          // Async crypto happens BEFORE the transaction (bun:sqlite txns are sync).
+          const prepared = await prepareDocument(db, {
+            title: up.title,
+            doc_type: up.doc_type,
+            mime_type: up.mime_type,
+            content: up.content,
+            actor_id: ctx.user.id,
+          });
+          if (prepared.deduped) {
+            const meta = getDocument(db, prepared.existingId!);
+            return jsonResponse({ ...meta, deduped: true });
+          }
+          let meta!: DocumentMeta;
+          // Direct transaction (not mutateWithAudit): the audit row needs the
+          // inserted id as entity_id, known only after insertDocument runs.
+          db.transaction(() => {
+            meta = insertDocument(db, prepared);
+            appendAudit(db, {
+              actor_id: ctx.user.id,
+              action: "document.upload",
+              entity_type: "document",
+              entity_id: String(meta.id),
+              before: null,
+              after: {
+                title: prepared.meta.title,
+                doc_type: prepared.meta.doc_type,
+                size_bytes: prepared.meta.size_bytes,
+                content_sha256: prepared.meta.content_sha256,
+                retain_until: prepared.meta.retain_until,
+              },
+            });
+          })();
+          return Response.json({ data: meta }, { status: 201 });
+        } catch (e) {
+          return documentError(e);
+        }
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  const id = parseIdParam(parts, 0);
+  if (id === null) return errorResponse("validation", "document id must be a positive integer", 400);
+
+  // --- download ---
+  if (parts.length === 2 && parts[1] === "content" && req.method === "GET") {
+    return perm("read", async () => {
+      try {
+        const { meta, bytes } = await getDocumentContent(db, id);
+        return new Response(bytes as BodyInit, {
+          headers: {
+            "content-type": meta.mime_type,
+            "content-length": String(bytes.length),
+            etag: `"${meta.content_sha256}"`,
+            "content-disposition": `attachment; filename="${safeFilename(meta.title)}"`,
+          },
+        });
+      } catch (e) {
+        return documentError(e);
+      }
+    })(req);
+  }
+
+  // --- item ---
+  if (parts.length === 1) {
+    if (req.method === "GET") {
+      return perm("read", () => {
+        const meta = getDocument(db, id);
+        return meta ? jsonResponse(meta) : errorResponse("not_found", "document not found", 404);
+      })(req);
+    }
+    if (req.method === "DELETE") {
+      return perm("write", (_req2, ctx) => {
+        try {
+          const before = getDocument(db, id);
+          if (!before) return errorResponse("not_found", "document not found", 404);
+          mutateWithAudit(
+            db,
+            {
+              actor_id: ctx.user.id,
+              action: "document.delete",
+              entity_type: "document",
+              entity_id: id,
+              before: { title: before.title, content_sha256: before.content_sha256 },
+            },
+            () => deleteDocument(db, id),
+          );
+          return jsonResponse({ deleted: true });
+        } catch (e) {
+          if (e instanceof RetentionError) {
+            // Denied deletions are security-relevant: audit the attempt.
+            appendAudit(db, {
+              actor_id: ctx.user.id,
+              action: "document.delete_denied",
+              entity_type: "document",
+              entity_id: id,
+              after: { reason: "retained" },
+            });
+          }
+          return documentError(e);
+        }
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
+/** All /api/v1/compliance/* routes beyond audit-log (F-R4). */
+function handleCompliance(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "audit", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/compliance/".length);
+
+  if (sub === "retention-report" && req.method === "GET") {
+    return perm("read", () => jsonResponse(retentionReport(db)))(req);
+  }
+
+  if (sub === "verify" && req.method === "GET") {
+    return perm("read", async () => jsonResponse(await verifyAll(db)))(req);
+  }
+
+  if (sub === "export" && req.method === "GET") {
+    return perm("read", () => {
+      const entity = url.searchParams.get("entity_type") ?? "audit_log";
+      if (entity !== "audit_log" && entity !== "documents" && entity !== "journal_entries") {
+        return errorResponse(
+          "validation",
+          "entity_type must be audit_log, documents, or journal_entries",
+          400,
+        );
+      }
+      const format = url.searchParams.get("format") ?? "json";
+      if (format !== "json" && format !== "csv") {
+        return errorResponse("validation", "format must be json or csv", 400);
+      }
+      const idParam = url.searchParams.get("entity_id");
+      const entity_id = idParam === null ? null : parseInt(idParam, 10);
+      if (idParam !== null && (!Number.isInteger(entity_id) || (entity_id as number) <= 0)) {
+        return errorResponse("validation", "entity_id must be a positive integer", 400);
+      }
+      try {
+        const out = exportRecords(db, entity, entity_id, format);
+        return new Response(out.body as BodyInit, {
+          headers: {
+            "content-type": out.contentType,
+            "content-disposition": `attachment; filename="${out.filename}"`,
+          },
+        });
+      } catch (e) {
+        return documentError(e);
+      }
+    })(req);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -550,6 +853,12 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path === "/api/v1/compliance/audit-log" && req.method === "GET") {
           return handleAuditLog(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/compliance/")) {
+          return handleCompliance(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/documents/") || path === "/api/v1/documents") {
+          return handleDocuments(req, db, cfg, url);
         }
         if (path.startsWith("/api/v1/ledger/")) {
           return handleLedger(req, db, cfg, url);
