@@ -46,6 +46,28 @@ import {
 } from "./documents";
 import { RetentionError, retentionReport } from "./retention";
 import { verifyAll, exportRecords, ComplianceError } from "./compliance";
+import {
+  createCustomer,
+  getCustomer,
+  listCustomers,
+  updateCustomer,
+  createInvoice,
+  getInvoice,
+  listInvoices,
+  updateInvoiceDraft,
+  postInvoice,
+  voidInvoice,
+  createPayment,
+  getPayment,
+  listPayments,
+  applyPayment,
+  createCreditMemo,
+  getCreditMemo,
+  listCreditMemos,
+  postCreditMemo,
+  voidCreditMemo,
+  ArError,
+} from "./ar";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -183,6 +205,61 @@ function ledgerError(e: unknown): Response {
     return errorResponse(e.code, e.message, status);
   }
   throw e;
+}
+
+/** Map an ArError to the stable error envelope; LedgerError delegates to ledgerError. */
+function arError(e: unknown): Response {
+  if (e instanceof LedgerError) return ledgerError(e);
+  if (e instanceof ArError) {
+    const status =
+      {
+        validation: 400,
+        over_applied: 400,
+        not_found: 404,
+        not_draft: 409,
+        not_posted: 409,
+        already_posted: 409,
+        already_void: 409,
+        void_blocked: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/**
+ * Run produce() for an AR mutation, honoring Idempotency-Key like the ledger
+ * routes: errors are NOT recorded (the retry can succeed), successes replay.
+ * produce() must return { status, body }; ArError/LedgerError inside it are
+ * mapped to the error envelope and returned, not recorded.
+ */
+function runArMutation(
+  req: Request,
+  db: Database,
+  ctx: Ctx,
+  scope: string,
+  path: string,
+  produce: () => { status: number; body: unknown },
+): Response {
+  const idemKey = req.headers.get("idempotency-key")?.trim().slice(0, 128);
+  const run = (): { status: number; body: unknown } => {
+    try {
+      return produce();
+    } catch (e) {
+      throw { __arHttp: arError(e) };
+    }
+  };
+  try {
+    const r = idemKey
+      ? withIdempotency(db, `${scope}:${ctx.user.id}:${idemKey}`, ctx.user.id, "POST", path, run)
+      : { replayed: false, ...run() };
+    return Response.json(r.body, { status: r.status });
+  } catch (e) {
+    if (e && typeof e === "object" && "__arHttp" in e) {
+      return (e as { __arHttp: Response }).__arHttp;
+    }
+    throw e;
+  }
 }
 
 /** Map document/retention/compliance errors to the envelope; rethrow others. */
@@ -831,6 +908,343 @@ function handleCompliance(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** All /api/v1/ar/* routes (Phase 3: customers, invoices, payments, credit memos). */
+function handleAr(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "ar", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/ar/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+  // --- customers ---
+  if (parts[0] === "customers") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listCustomers(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createCustomer(
+              db,
+              {
+                name: str(b.name) ?? "",
+                email: (b.email ?? null) as string | null,
+                phone: (b.phone ?? null) as string | null,
+                billing_address: (b.billing_address ?? null) as string | null,
+                credit_limit_cents: num(b.credit_limit_cents),
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "customer id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const c = getCustomer(db, id);
+          return c ? jsonResponse(c) : errorResponse("not_found", "customer not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateCustomer(
+              db,
+              id,
+              {
+                name: str(b.name),
+                email: b.email === undefined ? undefined : (b.email as string | null),
+                phone: b.phone === undefined ? undefined : (b.phone as string | null),
+                billing_address:
+                  b.billing_address === undefined ? undefined : (b.billing_address as string | null),
+                credit_limit_cents: num(b.credit_limit_cents),
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- invoices ---
+  if (parts[0] === "invoices") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const customer_id = url.searchParams.get("customer_id");
+            return jsonResponse(
+              listInvoices(db, {
+                customer_id: customer_id ? parseInt(customer_id, 10) || undefined : undefined,
+                status: url.searchParams.get("status") ?? undefined,
+              }),
+            );
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createInvoice(
+              db,
+              {
+                customer_id: num(b.customer_id) ?? 0,
+                issue_date: str(b.issue_date) ?? "",
+                due_date: str(b.due_date) ?? "",
+                tax_cents: num(b.tax_cents),
+                lines: Array.isArray(b.lines) ? b.lines : [],
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "invoice id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getInvoice(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "invoice not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateInvoiceDraft(
+              db,
+              id,
+              {
+                due_date: str(b.due_date),
+                tax_cents: num(b.tax_cents),
+                lines: Array.isArray(b.lines) ? b.lines : undefined,
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      if (parts[2] === "post") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runArMutation(req2, db, ctx, `invoice-post:${id}`, `/api/v1/ar/invoices/${id}/post`, () => ({
+            status: 200,
+            body: { data: postInvoice(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+      if (parts[2] === "void") {
+        return perm("approve", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runArMutation(req2, db, ctx, `invoice-void:${id}`, `/api/v1/ar/invoices/${id}/void`, () => ({
+            status: 200,
+            body: { data: voidInvoice(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- payments ---
+  if (parts[0] === "payments") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const customer_id = url.searchParams.get("customer_id");
+          return jsonResponse(
+            listPayments(db, {
+              customer_id: customer_id ? parseInt(customer_id, 10) || undefined : undefined,
+            }),
+          );
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runArMutation(req2, db, ctx, "payment-create", "/api/v1/ar/payments", () => ({
+            status: 201,
+            body: {
+              data: createPayment(
+                db,
+                {
+                  customer_id: num(b.customer_id) ?? 0,
+                  method: str(b.method) ?? "",
+                  amount_cents: num(b.amount_cents) ?? 0,
+                  received_on: str(b.received_on) ?? "",
+                  applications: Array.isArray(b.applications) ? b.applications : undefined,
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "payment id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getPayment(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "payment not found", 404);
+      })(req);
+    }
+    if (parts.length === 3 && parts[2] === "apply" && req.method === "POST") {
+      return perm("post", async (req2, ctx) => {
+        const parsed = await parseJsonBody(req2);
+        if (!parsed.ok) return parsed.response;
+        const b = parsed.body;
+        return runArMutation(req2, db, ctx, `payment-apply:${id}`, `/api/v1/ar/payments/${id}/apply`, () => ({
+          status: 200,
+          body: {
+            data: applyPayment(db, id, num(b.invoice_id) ?? 0, num(b.amount_cents) ?? 0, ctx.user.id),
+          },
+        }));
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- credit memos ---
+  if (parts[0] === "credit-memos") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const customer_id = url.searchParams.get("customer_id");
+          const invoice_id = url.searchParams.get("invoice_id");
+          return jsonResponse(
+            listCreditMemos(db, {
+              customer_id: customer_id ? parseInt(customer_id, 10) || undefined : undefined,
+              invoice_id: invoice_id ? parseInt(invoice_id, 10) || undefined : undefined,
+            }),
+          );
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createCreditMemo(
+              db,
+              {
+                customer_id: num(b.customer_id) ?? 0,
+                invoice_id: num(b.invoice_id) ?? 0,
+                amount_cents: num(b.amount_cents) ?? 0,
+                reason: str(b.reason) ?? "",
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return arError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "credit memo id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getCreditMemo(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "credit memo not found", 404);
+      })(req);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      if (parts[2] === "post") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runArMutation(req2, db, ctx, `cm-post:${id}`, `/api/v1/ar/credit-memos/${id}/post`, () => ({
+            status: 200,
+            body: { data: postCreditMemo(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+      if (parts[2] === "void") {
+        return perm("approve", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runArMutation(req2, db, ctx, `cm-void:${id}`, `/api/v1/ar/credit-memos/${id}/void`, () => ({
+            status: 200,
+            body: { data: voidCreditMemo(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -862,6 +1276,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/ledger/")) {
           return handleLedger(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/ar/")) {
+          return handleAr(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {

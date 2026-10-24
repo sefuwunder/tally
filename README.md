@@ -42,13 +42,14 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–2 surface)
+## API (Phase 0–3 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
 `invalid_credentials`, `account_locked`, `not_found`, `unbalanced`,
 `period_closed`, `already_reversed`, `in_use`, `overlap`, `no_open_period`,
-`retained`, `corrupt`).
+`retained`, `corrupt`, `over_applied`, `not_draft`, `not_posted`,
+`already_posted`, `already_void`, `void_blocked`).
 
 ```
 POST /api/v1/auth/login { email, password } -> { token, expires_at, must_change_password }
@@ -85,6 +86,31 @@ POST /api/v1/ledger/periods { name, starts_on, ends_on }   (ledger:write)
 POST /api/v1/ledger/periods/:id/close            (ledger:approve; trial-balance gate)
 POST /api/v1/ledger/periods/:id/reopen           (ledger:admin; audited)
 GET  /api/v1/ledger/trial-balance?period_id=     (ledger:read)
+POST /api/v1/ar/customers { name, email?, phone?, billing_address?, credit_limit_cents?, status? }  (ar:write)
+GET  /api/v1/ar/customers                        (ar:read; ?status=)
+GET  /api/v1/ar/customers/:id                    (ar:read)
+PATCH /api/v1/ar/customers/:id                   (ar:write)
+POST /api/v1/ar/invoices { customer_id, issue_date, due_date, tax_cents?, lines[] }  (ar:write; draft)
+GET  /api/v1/ar/invoices                         (ar:read; ?customer_id= &status=)
+GET  /api/v1/ar/invoices/:id                     (ar:read; includes lines + open_balance_cents)
+PATCH /api/v1/ar/invoices/:id { due_date?, tax_cents?, lines? }  (ar:write; draft only)
+POST /api/v1/ar/invoices/:id/post                (ar:post; Idempotency-Key honored)
+     Dr AR 1100 / Cr Revenue 4000 / Cr Tax Payable 2100; GL posted_on = issue_date
+POST /api/v1/ar/invoices/:id/void                (ar:approve; Idempotency-Key honored)
+     reversing entry; refused while payments/credits are applied (void_blocked)
+POST /api/v1/ar/payments { customer_id, method, amount_cents, received_on, applications?[] }  (ar:post; Idempotency-Key honored)
+     Dr Cash 1000 / Cr AR 1100 for the full amount; applications allocate AR, never over-apply
+GET  /api/v1/ar/payments                         (ar:read; ?customer_id=)
+GET  /api/v1/ar/payments/:id                     (ar:read; includes applications)
+POST /api/v1/ar/payments/:id/apply { invoice_id, amount_cents }  (ar:post; Idempotency-Key honored)
+     applies leftover on-account credit; no new GL entry (cash already recognized)
+POST /api/v1/ar/credit-memos { customer_id, invoice_id, amount_cents, reason }  (ar:write; draft)
+GET  /api/v1/ar/credit-memos                     (ar:read; ?customer_id= &invoice_id=)
+GET  /api/v1/ar/credit-memos/:id                 (ar:read)
+POST /api/v1/ar/credit-memos/:id/post            (ar:post; Idempotency-Key honored)
+     Dr Revenue 4000 / Cr AR 1100; re-validated against the CURRENT open balance
+POST /api/v1/ar/credit-memos/:id/void            (ar:approve; Idempotency-Key honored)
+     reversing entry; restores the invoice's open balance
 GET  /health
 ```
 
@@ -126,6 +152,19 @@ hash), and reports per-type retention coverage. `GET /api/v1/compliance/export`
 streams records plus their full audit history as JSON or CSV
 (17a-4(f)(2)(ii)–(iv) "ready download/transfer").
 
+Accounts receivable (Phase 3): customers, invoices (+lines), payments with
+application logic, credit memos — all GL effects via `postJournal()` /
+`reverseJournal()`, never direct journal writes. Invoices are drafts until
+posted (Dr AR / Cr Revenue / Cr Tax Payable, posted_on = issue_date); posted
+invoices are never edited in place — corrections are voids (reversing entry,
+original untouched) or credit memos. A payment's applications can never exceed
+an invoice's open balance (single, combined, or against unapplied credit),
+and a credit memo re-validates against the current open balance at post time,
+so a balance that moved since drafting can never be over-credited. Voiding an
+invoice with payments/credits applied is refused (`void_blocked`) — credit the
+balance instead. Credit limits are recorded on customers but not yet enforced
+(v1 honesty note; enforcement lands with AP/credit policy work).
+
 ## Layout
 
 ```
@@ -138,6 +177,7 @@ src/audit.ts       hash-chained append-only log + chain verification
 src/middleware.ts  JSON/errors, auth+RBAC wrappers, audited-mutation helper
 src/ledger.ts      ledger core: postJournal/reverseJournal, accounts, periods,
                    trial balance, account ledger, idempotency
+src/ar.ts          AR: customers, invoices, payments, credit memos (via ledger only)
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -148,7 +188,7 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–2)
+## Compliance map (Phase 0–3)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
