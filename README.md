@@ -42,14 +42,15 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–3 surface)
+## API (Phase 0–4 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
 `invalid_credentials`, `account_locked`, `not_found`, `unbalanced`,
 `period_closed`, `already_reversed`, `in_use`, `overlap`, `no_open_period`,
 `retained`, `corrupt`, `over_applied`, `not_draft`, `not_posted`,
-`already_posted`, `already_void`, `void_blocked`).
+`already_posted`, `already_void`, `void_blocked`,
+`not_approved`, `already_approved`, `self_approval`).
 
 ```
 POST /api/v1/auth/login { email, password } -> { token, expires_at, must_change_password }
@@ -111,6 +112,29 @@ POST /api/v1/ar/credit-memos/:id/post            (ar:post; Idempotency-Key honor
      Dr Revenue 4000 / Cr AR 1100; re-validated against the CURRENT open balance
 POST /api/v1/ar/credit-memos/:id/void            (ar:approve; Idempotency-Key honored)
      reversing entry; restores the invoice's open balance
+POST /api/v1/ap/vendors { name, email?, phone?, remittance_address?, status? }  (ap:write)
+GET  /api/v1/ap/vendors                          (ap:read; ?status=)
+GET  /api/v1/ap/vendors/:id                      (ap:read)
+PATCH /api/v1/ap/vendors/:id                     (ap:write)
+POST /api/v1/ap/bills { vendor_id, bill_date, due_date, tax_cents?, lines[] }  (ap:write; draft)
+     each line carries account_code — the account debited at post time
+GET  /api/v1/ap/bills                            (ap:read; ?vendor_id= &status=)
+GET  /api/v1/ap/bills/:id                        (ap:read; includes lines + open_balance_cents)
+PATCH /api/v1/ap/bills/:id { due_date?, tax_cents?, lines? }  (ap:write; draft only)
+POST /api/v1/ap/bills/:id/approve                (ap:approve; maker-checker)
+     draft -> approved; approver must differ from the creator (self_approval, 403);
+     recorded as approved_by/approved_at
+POST /api/v1/ap/bills/:id/post                   (ap:post; Idempotency-Key honored)
+     approved only (not_approved, 409); Dr each line's account / Cr AP 2000;
+     GL posted_on = bill_date
+POST /api/v1/ap/bills/:id/void                   (ap:approve; Idempotency-Key honored)
+     reversing entry; refused while payments are applied (void_blocked)
+POST /api/v1/ap/bill-payments { vendor_id, method, amount_cents, paid_on, applications?[] }  (ap:post; Idempotency-Key honored)
+     Dr AP 2000 / Cr Cash 1000 for the full amount; applications allocate AP, never over-apply
+GET  /api/v1/ap/bill-payments                    (ap:read; ?vendor_id=)
+GET  /api/v1/ap/bill-payments/:id                (ap:read; includes applications)
+POST /api/v1/ap/bill-payments/:id/apply { bill_id, amount_cents }  (ap:post; Idempotency-Key honored)
+     applies leftover on-account credit; no new GL entry (cash already recognized)
 GET  /health
 ```
 
@@ -165,6 +189,19 @@ invoice with payments/credits applied is refused (`void_blocked`) — credit the
 balance instead. Credit limits are recorded on customers but not yet enforced
 (v1 honesty note; enforcement lands with AP/credit policy work).
 
+Accounts payable (Phase 4): vendors, bills (+lines, each line carrying the
+account debited at post time), bill payments with application logic — all GL
+effects via `postJournal()` / `reverseJournal()`, never direct journal writes.
+Bills move draft → approved → posted under maker-checker: approval requires
+`ap:approve` AND a different user than the creator (`self_approval`, 403),
+and the approver is recorded (`approved_by`/`approved_at`) so supervision can
+prove the second pair of eyes. Posting an unapproved bill is refused
+(`not_approved`); posting debits each line's account and credits AP 2000
+(posted_on = bill_date). Payments debit AP / credit Cash for the full amount;
+applications allocate AP and can never exceed a bill's open balance (single,
+combined, or against unapplied credit), and voiding a bill with payments
+applied is refused (`void_blocked`).
+
 ## Layout
 
 ```
@@ -178,6 +215,7 @@ src/middleware.ts  JSON/errors, auth+RBAC wrappers, audited-mutation helper
 src/ledger.ts      ledger core: postJournal/reverseJournal, accounts, periods,
                    trial balance, account ledger, idempotency
 src/ar.ts          AR: customers, invoices, payments, credit memos (via ledger only)
+src/ap.ts          AP: vendors, bills with maker-checker approval, bill payments (via ledger only)
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -188,12 +226,13 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–3)
+## Compliance map (Phase 0–4)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
 H-A2 access management · H-A3 password management · H-A5 6y documentation
 retention · F-R1 books/records substrate · F-R2 format/media · F-R3
 immutability + WORM path · F-R4 automatic verification, export/download ·
-F-R7 retention periods. Full citations in the goal workspace
+F-R7 retention periods · F-S supervision angle (AP maker-checker approval
+with recorded approver). Full citations in the goal workspace
 `compliance-matrix.md`.

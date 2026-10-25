@@ -68,6 +68,24 @@ import {
   voidCreditMemo,
   ArError,
 } from "./ar";
+import {
+  createVendor,
+  getVendor,
+  listVendors,
+  updateVendor,
+  createBill,
+  getBill,
+  listBills,
+  updateBillDraft,
+  approveBill,
+  postBill,
+  voidBill,
+  createBillPayment,
+  getBillPayment,
+  listBillPayments,
+  applyBillPayment,
+  ApError,
+} from "./ap";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -257,6 +275,64 @@ function runArMutation(
   } catch (e) {
     if (e && typeof e === "object" && "__arHttp" in e) {
       return (e as { __arHttp: Response }).__arHttp;
+    }
+    throw e;
+  }
+}
+
+/** Map an ApError to the stable error envelope; LedgerError delegates to ledgerError. */
+function apError(e: unknown): Response {
+  if (e instanceof LedgerError) return ledgerError(e);
+  if (e instanceof ApError) {
+    const status =
+      {
+        validation: 400,
+        over_applied: 400,
+        not_found: 404,
+        self_approval: 403,
+        not_draft: 409,
+        not_approved: 409,
+        not_posted: 409,
+        already_posted: 409,
+        already_approved: 409,
+        already_void: 409,
+        void_blocked: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/**
+ * Run produce() for an AP mutation, honoring Idempotency-Key like the AR
+ * routes: errors are NOT recorded (the retry can succeed), successes replay.
+ * produce() must return { status, body }; ApError/LedgerError inside it are
+ * mapped to the error envelope and returned, not recorded.
+ */
+function runApMutation(
+  req: Request,
+  db: Database,
+  ctx: Ctx,
+  scope: string,
+  path: string,
+  produce: () => { status: number; body: unknown },
+): Response {
+  const idemKey = req.headers.get("idempotency-key")?.trim().slice(0, 128);
+  const run = (): { status: number; body: unknown } => {
+    try {
+      return produce();
+    } catch (e) {
+      throw { __apHttp: apError(e) };
+    }
+  };
+  try {
+    const r = idemKey
+      ? withIdempotency(db, `${scope}:${ctx.user.id}:${idemKey}`, ctx.user.id, "POST", path, run)
+      : { replayed: false, ...run() };
+    return Response.json(r.body, { status: r.status });
+  } catch (e) {
+    if (e && typeof e === "object" && "__apHttp" in e) {
+      return (e as { __apHttp: Response }).__apHttp;
     }
     throw e;
   }
@@ -1245,6 +1321,280 @@ function handleAr(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** All /api/v1/ap/* routes (Phase 4: vendors, bills with maker-checker approval, bill payments). */
+function handleAp(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "ap", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/ap/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+  // --- vendors ---
+  if (parts[0] === "vendors") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listVendors(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createVendor(
+              db,
+              {
+                name: str(b.name) ?? "",
+                email: (b.email ?? null) as string | null,
+                phone: (b.phone ?? null) as string | null,
+                remittance_address: (b.remittance_address ?? null) as string | null,
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "vendor id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getVendor(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "vendor not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateVendor(
+              db,
+              id,
+              {
+                name: str(b.name),
+                email: b.email === undefined ? undefined : (b.email as string | null),
+                phone: b.phone === undefined ? undefined : (b.phone as string | null),
+                remittance_address:
+                  b.remittance_address === undefined ? undefined : (b.remittance_address as string | null),
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- bills ---
+  if (parts[0] === "bills") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const vendor_id = url.searchParams.get("vendor_id");
+            return jsonResponse(
+              listBills(db, {
+                vendor_id: vendor_id ? parseInt(vendor_id, 10) || undefined : undefined,
+                status: url.searchParams.get("status") ?? undefined,
+              }),
+            );
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createBill(
+              db,
+              {
+                vendor_id: num(b.vendor_id) ?? 0,
+                bill_date: str(b.bill_date) ?? "",
+                due_date: str(b.due_date) ?? "",
+                tax_cents: num(b.tax_cents),
+                lines: Array.isArray(b.lines) ? b.lines : [],
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "bill id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getBill(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "bill not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateBillDraft(
+              db,
+              id,
+              {
+                due_date: str(b.due_date),
+                tax_cents: num(b.tax_cents),
+                lines: Array.isArray(b.lines) ? b.lines : undefined,
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      if (parts[2] === "approve") {
+        return perm("approve", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          try {
+            return jsonResponse(approveBill(db, id, ctx.user.id));
+          } catch (e) {
+            return apError(e);
+          }
+        })(req);
+      }
+      if (parts[2] === "post") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runApMutation(req2, db, ctx, `bill-post:${id}`, `/api/v1/ap/bills/${id}/post`, () => ({
+            status: 200,
+            body: { data: postBill(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+      if (parts[2] === "void") {
+        return perm("approve", async (req2, ctx) => {
+          const parsed = await parseJsonBodyLenient(req2);
+          if (!parsed.ok) return parsed.response;
+          return runApMutation(req2, db, ctx, `bill-void:${id}`, `/api/v1/ap/bills/${id}/void`, () => ({
+            status: 200,
+            body: { data: voidBill(db, id, ctx.user.id) },
+          }));
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- bill payments ---
+  if (parts[0] === "bill-payments") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const vendor_id = url.searchParams.get("vendor_id");
+          return jsonResponse(
+            listBillPayments(db, {
+              vendor_id: vendor_id ? parseInt(vendor_id, 10) || undefined : undefined,
+            }),
+          );
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runApMutation(req2, db, ctx, "bill-payment-create", "/api/v1/ap/bill-payments", () => ({
+            status: 201,
+            body: {
+              data: createBillPayment(
+                db,
+                {
+                  vendor_id: num(b.vendor_id) ?? 0,
+                  method: str(b.method) ?? "",
+                  amount_cents: num(b.amount_cents) ?? 0,
+                  paid_on: str(b.paid_on) ?? "",
+                  applications: Array.isArray(b.applications) ? b.applications : undefined,
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "bill payment id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getBillPayment(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "bill payment not found", 404);
+      })(req);
+    }
+    if (parts.length === 3 && parts[2] === "apply" && req.method === "POST") {
+      return perm("post", async (req2, ctx) => {
+        const parsed = await parseJsonBody(req2);
+        if (!parsed.ok) return parsed.response;
+        const b = parsed.body;
+        return runApMutation(req2, db, ctx, `bill-payment-apply:${id}`, `/api/v1/ap/bill-payments/${id}/apply`, () => ({
+          status: 200,
+          body: {
+            data: applyBillPayment(db, id, num(b.bill_id) ?? 0, num(b.amount_cents) ?? 0, ctx.user.id),
+          },
+        }));
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -1279,6 +1629,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/ar/")) {
           return handleAr(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/ap/")) {
+          return handleAp(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {
