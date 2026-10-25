@@ -86,6 +86,23 @@ import {
   applyBillPayment,
   ApError,
 } from "./ap";
+import {
+  createItem,
+  getItem,
+  listItems,
+  updateItem,
+  createWarehouse,
+  getWarehouse,
+  listWarehouses,
+  updateWarehouse,
+  receiveStock,
+  issueStock,
+  adjustStock,
+  transferStock,
+  listStockLevels,
+  listMovements,
+  InventoryError,
+} from "./inventory";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -333,6 +350,56 @@ function runApMutation(
   } catch (e) {
     if (e && typeof e === "object" && "__apHttp" in e) {
       return (e as { __apHttp: Response }).__apHttp;
+    }
+    throw e;
+  }
+}
+
+/** Map an InventoryError to the stable error envelope; LedgerError delegates. */
+function inventoryError(e: unknown): Response {
+  if (e instanceof LedgerError) return ledgerError(e);
+  if (e instanceof InventoryError) {
+    const status =
+      {
+        validation: 400,
+        no_cost_basis: 400,
+        not_found: 404,
+        negative_stock: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/**
+ * Run produce() for an inventory movement, honoring Idempotency-Key like
+ * the AR/AP routes: errors are NOT recorded, successes replay.
+ * produce() must return { status, body }.
+ */
+function runInventoryMutation(
+  req: Request,
+  db: Database,
+  ctx: Ctx,
+  scope: string,
+  path: string,
+  produce: () => { status: number; body: unknown },
+): Response {
+  const idemKey = req.headers.get("idempotency-key")?.trim().slice(0, 128);
+  const run = (): { status: number; body: unknown } => {
+    try {
+      return produce();
+    } catch (e) {
+      throw { __invHttp: inventoryError(e) };
+    }
+  };
+  try {
+    const r = idemKey
+      ? withIdempotency(db, `${scope}:${ctx.user.id}:${idemKey}`, ctx.user.id, "POST", path, run)
+      : { replayed: false, ...run() };
+    return Response.json(r.body, { status: r.status });
+  } catch (e) {
+    if (e && typeof e === "object" && "__invHttp" in e) {
+      return (e as { __invHttp: Response }).__invHttp;
     }
     throw e;
   }
@@ -1595,6 +1662,315 @@ function handleAp(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** All /api/v1/inventory/* routes (Phase 5: items, warehouses, movements, levels). */
+function handleInventory(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "inventory", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/inventory/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+  // --- items ---
+  if (parts[0] === "items") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listItems(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return inventoryError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createItem(
+              db,
+              {
+                sku: str(b.sku) ?? "",
+                name: str(b.name) ?? "",
+                description: (b.description ?? null) as string | null,
+                unit: str(b.unit),
+                allow_negative_stock: typeof b.allow_negative_stock === "boolean" ? b.allow_negative_stock : undefined,
+                inventory_account_code: str(b.inventory_account_code),
+                cogs_account_code: str(b.cogs_account_code),
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return inventoryError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "item id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getItem(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "item not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateItem(
+              db,
+              id,
+              {
+                sku: str(b.sku),
+                name: str(b.name),
+                description: b.description === undefined ? undefined : (b.description as string | null),
+                unit: str(b.unit),
+                allow_negative_stock: typeof b.allow_negative_stock === "boolean" ? b.allow_negative_stock : undefined,
+                inventory_account_code: str(b.inventory_account_code),
+                cogs_account_code: str(b.cogs_account_code),
+                status: str(b.status),
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return inventoryError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- warehouses ---
+  if (parts[0] === "warehouses") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => jsonResponse(listWarehouses(db)))(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createWarehouse(
+              db,
+              {
+                code: str(b.code) ?? "",
+                name: str(b.name) ?? "",
+                location: (b.location ?? null) as string | null,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return inventoryError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "warehouse id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getWarehouse(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "warehouse not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updateWarehouse(
+              db,
+              id,
+              {
+                code: str(b.code),
+                name: str(b.name),
+                location: b.location === undefined ? undefined : (b.location as string | null),
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return inventoryError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- movements ---
+  if (parts[0] === "movements") {
+    if (parts.length === 1 && req.method === "GET") {
+      return perm("read", () => {
+        try {
+          const item_id = url.searchParams.get("item_id");
+          const warehouse_id = url.searchParams.get("warehouse_id");
+          return jsonResponse(
+            listMovements(db, {
+              item_id: item_id ? parseInt(item_id, 10) || undefined : undefined,
+              warehouse_id: warehouse_id ? parseInt(warehouse_id, 10) || undefined : undefined,
+              movement_type: url.searchParams.get("movement_type") ?? undefined,
+            }),
+          );
+        } catch (e) {
+          return inventoryError(e);
+        }
+      })(req);
+    }
+    if (parts.length === 2 && req.method === "POST") {
+      if (parts[1] === "receipt") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runInventoryMutation(req2, db, ctx, "stock-receipt", "/api/v1/inventory/movements/receipt", () => ({
+            status: 201,
+            body: {
+              data: receiveStock(
+                db,
+                {
+                  item_id: num(b.item_id) ?? 0,
+                  warehouse_id: num(b.warehouse_id) ?? 0,
+                  quantity: num(b.quantity) ?? 0,
+                  unit_cost_cents: num(b.unit_cost_cents) ?? 0,
+                  movement_date: str(b.movement_date),
+                  reason: (b.reason ?? null) as string | null,
+                  source_type: str(b.source_type),
+                  source_id: str(b.source_id),
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+      if (parts[1] === "issue") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runInventoryMutation(req2, db, ctx, "stock-issue", "/api/v1/inventory/movements/issue", () => ({
+            status: 201,
+            body: {
+              data: issueStock(
+                db,
+                {
+                  item_id: num(b.item_id) ?? 0,
+                  warehouse_id: num(b.warehouse_id) ?? 0,
+                  quantity: num(b.quantity) ?? 0,
+                  movement_date: str(b.movement_date),
+                  reason: (b.reason ?? null) as string | null,
+                  source_type: str(b.source_type),
+                  source_id: str(b.source_id),
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+      if (parts[1] === "adjust") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runInventoryMutation(req2, db, ctx, "stock-adjust", "/api/v1/inventory/movements/adjust", () => ({
+            status: 201,
+            body: {
+              data: adjustStock(
+                db,
+                {
+                  item_id: num(b.item_id) ?? 0,
+                  warehouse_id: num(b.warehouse_id) ?? 0,
+                  quantity: num(b.quantity) ?? 0,
+                  unit_cost_cents: num(b.unit_cost_cents),
+                  movement_date: str(b.movement_date),
+                  reason: str(b.reason) ?? "",
+                  source_type: str(b.source_type),
+                  source_id: str(b.source_id),
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+      if (parts[1] === "transfer") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runInventoryMutation(req2, db, ctx, "stock-transfer", "/api/v1/inventory/movements/transfer", () => ({
+            status: 201,
+            body: {
+              data: transferStock(
+                db,
+                {
+                  item_id: num(b.item_id) ?? 0,
+                  from_warehouse_id: num(b.from_warehouse_id) ?? 0,
+                  to_warehouse_id: num(b.to_warehouse_id) ?? 0,
+                  quantity: num(b.quantity) ?? 0,
+                  movement_date: str(b.movement_date),
+                  reason: (b.reason ?? null) as string | null,
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- levels ---
+  if (parts[0] === "levels" && parts.length === 1 && req.method === "GET") {
+    return perm("read", () => {
+      const item_id = url.searchParams.get("item_id");
+      const warehouse_id = url.searchParams.get("warehouse_id");
+      return jsonResponse(
+        listStockLevels(db, {
+          item_id: item_id ? parseInt(item_id, 10) || undefined : undefined,
+          warehouse_id: warehouse_id ? parseInt(warehouse_id, 10) || undefined : undefined,
+        }),
+      );
+    })(req);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -1632,6 +2008,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/ap/")) {
           return handleAp(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/inventory/")) {
+          return handleInventory(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {

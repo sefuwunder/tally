@@ -42,7 +42,7 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–4 surface)
+## API (Phase 0–5 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
@@ -128,6 +128,24 @@ POST /api/v1/ap/bills/:id/post                   (ap:post; Idempotency-Key honor
      approved only (not_approved, 409); Dr each line's account / Cr AP 2000;
      GL posted_on = bill_date
 POST /api/v1/ap/bills/:id/void                   (ap:approve; Idempotency-Key honored)
+POST /api/v1/inventory/items { sku, name, description?, unit?, allow_negative_stock?, inventory_account_code?, cogs_account_code?, status? }  (inventory:write)
+GET  /api/v1/inventory/items                     (inventory:read; ?status=)
+GET  /api/v1/inventory/items/:id                (inventory:read)
+PATCH /api/v1/inventory/items/:id { name?, description?, unit?, allow_negative_stock?, status? }  (inventory:write; account codes frozen once movements exist)
+POST /api/v1/inventory/warehouses { code, name, location? }  (inventory:write)
+GET  /api/v1/inventory/warehouses                (inventory:read)
+GET  /api/v1/inventory/warehouses/:id            (inventory:read)
+PATCH /api/v1/inventory/warehouses/:id { name?, location? }  (inventory:write)
+POST /api/v1/inventory/movements/receipt { item_id, warehouse_id, quantity, unit_cost_cents, movement_date?, reason? }  (inventory:post; Idempotency-Key honored)
+     updates weighted-average cost; no GL entry in v1 (Phase 6 posts on receiving)
+POST /api/v1/inventory/movements/issue { item_id, warehouse_id, quantity, movement_date?, reason? }  (inventory:post; Idempotency-Key honored)
+     Dr COGS / Cr Inventory at average cost; blocked below zero unless the item allows it
+POST /api/v1/inventory/movements/adjust { item_id, warehouse_id, quantity, unit_cost_cents?, movement_date?, reason }  (inventory:post; Idempotency-Key honored)
+     signed quantity; reason required; no GL entry in v1
+POST /api/v1/inventory/movements/transfer { item_id, from_warehouse_id, to_warehouse_id, quantity, movement_date?, reason? }  (inventory:post; Idempotency-Key honored)
+     two legs, one transaction, at source average; no GL entry
+GET  /api/v1/inventory/movements                 (inventory:read; ?item_id= &warehouse_id= &movement_type=)
+GET  /api/v1/inventory/levels                    (inventory:read; ?item_id= &warehouse_id=; quantity + avg cost + value)
      reversing entry; refused while payments are applied (void_blocked)
 POST /api/v1/ap/bill-payments { vendor_id, method, amount_cents, paid_on, applications?[] }  (ap:post; Idempotency-Key honored)
      Dr AP 2000 / Cr Cash 1000 for the full amount; applications allocate AP, never over-apply
@@ -202,6 +220,28 @@ applications allocate AP and can never exceed a bill's open balance (single,
 combined, or against unapplied credit), and voiding a bill with payments
 applied is refused (`void_blocked`).
 
+Inventory (Phase 5): items, warehouses, append-only `stock_movements`
+(trigger-enforced, like posted journals), weighted-average costing per
+item×warehouse, and a derived `stock_levels` view that always equals
+Σmovements (a recompute check proves the costing ledger agrees).
+Receipts update the average (`round((old_qty×old_avg + qty×cost) /
+(old_qty+qty))` in integer cents); issues consume at the current average
+and post Dr COGS / Cr Inventory via `postJournal()` (posted_on =
+movement_date, so closed-period rules apply); adjustments are count
+corrections with a required reason (positive re-averages like a receipt,
+negative consumes at the average); transfers move stock between
+warehouses at the source average with two legs in one transaction.
+Negative stock is blocked unless the item allows it
+(`negative_stock`, 409), and issuing from a warehouse with no receipt
+history is refused (`no_cost_basis`, 400) — there is no COGS to post.
+A zero-cost issue posts no journal entry (a 0-cent entry would fail the
+balance rule). Receipts, adjustments, and transfers post NO journal
+entry in v1 (documented gap, not oversight): receipts are quantity+cost
+events (Phase 6 procurement posts Dr Inventory / Cr accrual on
+receiving), adjustments are reconciled at period end, and a transfer
+keeps value inside Inventory. Item account codes freeze once the item
+has movements — they are part of posted history.
+
 ## Layout
 
 ```
@@ -216,6 +256,8 @@ src/ledger.ts      ledger core: postJournal/reverseJournal, accounts, periods,
                    trial balance, account ledger, idempotency
 src/ar.ts          AR: customers, invoices, payments, credit memos (via ledger only)
 src/ap.ts          AP: vendors, bills with maker-checker approval, bill payments (via ledger only)
+src/inventory.ts   inventory: items, warehouses, append-only movements,
+                   weighted-average costing, COGS posting on issue (via ledger only)
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -226,7 +268,7 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–4)
+## Compliance map (Phase 0–5)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
