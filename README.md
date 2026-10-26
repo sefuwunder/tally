@@ -42,7 +42,7 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–5 surface)
+## API (Phase 0–6 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
@@ -50,7 +50,9 @@ codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
 `period_closed`, `already_reversed`, `in_use`, `overlap`, `no_open_period`,
 `retained`, `corrupt`, `over_applied`, `not_draft`, `not_posted`,
 `already_posted`, `already_void`, `void_blocked`,
-`not_approved`, `already_approved`, `self_approval`).
+`not_approved`, `already_approved`, `self_approval`, `not_receivable`,
+`over_received`, `line_mismatch`, `not_submitted`, `not_cancellable`,
+`already_closed`, `already_cancelled`).
 
 ```
 POST /api/v1/auth/login { email, password } -> { token, expires_at, must_change_password }
@@ -153,6 +155,18 @@ GET  /api/v1/ap/bill-payments                    (ap:read; ?vendor_id=)
 GET  /api/v1/ap/bill-payments/:id                (ap:read; includes applications)
 POST /api/v1/ap/bill-payments/:id/apply { bill_id, amount_cents }  (ap:post; Idempotency-Key honored)
      applies leftover on-account credit; no new GL entry (cash already recognized)
+POST /api/v1/procurement/purchase-orders { vendor_id, order_date, expected_date?, notes?, lines[] }  (procurement:write; draft)
+GET  /api/v1/procurement/purchase-orders  (procurement:read; ?vendor_id= &status=)
+GET  /api/v1/procurement/purchase-orders/:id  (procurement:read; includes lines + remaining quantities)
+PATCH /api/v1/procurement/purchase-orders/:id { vendor_id?, order_date?, expected_date?, notes?, lines? }  (procurement:write; draft only)
+POST /api/v1/procurement/purchase-orders/:id/submit  (procurement:write; draft -> open)
+POST /api/v1/procurement/purchase-orders/:id/close  (procurement:write; open/partially/fully -> closed)
+POST /api/v1/procurement/purchase-orders/:id/cancel  (procurement:write; draft/open/partially -> cancelled)
+POST /api/v1/procurement/purchase-orders/:id/receive { warehouse_id, receiving_date?, lines[] }  (procurement:post; Idempotency-Key honored)
+     lines carry only po_line_id + quantity; books stock movements + Dr Inventory / Cr AP 2000
+     accrual + PO progress in one transaction; zero-cost receiving posts no journal entry
+GET  /api/v1/procurement/receivings  (procurement:read; ?po_id= &warehouse_id=)
+GET  /api/v1/procurement/receivings/:id  (procurement:read; includes lines + accrued entry)
 GET  /health
 ```
 
@@ -242,6 +256,36 @@ receiving), adjustments are reconciled at period end, and a transfer
 keeps value inside Inventory. Item account codes freeze once the item
 has movements — they are part of posted history.
 
+Procurement (Phase 6): purchase orders (+lines, each line carrying its
+ordered quantity and PO unit cost), receivings, and a status machine —
+draft → open → partially_received / fully_received → closed, or
+cancelled from draft/open/partially_received. Draft-only edits, like AP
+bills; closing a draft is refused (`not_submitted`), cancelling a fully
+received PO is refused (`not_cancellable` — the goods are in stock, close
+it instead). A receiving takes only `po_line_id` + quantity per line —
+no item or price in the input — so the item and the cost always come
+from the PO line itself: a nonexistent line is `not_found`, a line from
+another PO is `line_mismatch` (400), and any quantity past the remaining
+(ordered − received, checked jointly across duplicate lines in one
+receiving, backstopped by a DB CHECK) is `over_received` (400). One
+transaction books the receiving's stock movements (via inventory
+`receiveStock`, so weighted-average costing moves with the goods), the
+accrual journal (Dr each item's Inventory account / Cr AP 2000, grouped
+by account, posted_on = receiving_date), the append-only receiving rows
+(trigger-enforced, like posted journals), the `quantity_received` bumps,
+and the PO status step — a closed period, an inactive item, or an
+over-receipt rolls all of it back. A zero-cost receiving posts no journal
+entry (same rule as zero-cost issues) and leaves `accrued_entry_id`
+null. The accrual is a journal entry, NOT a bills row: a bill must still
+pass AP maker-checker approval, so receiving never mints an approved bill
+on its own — and a vendor invoice bill must not also be posted for the
+same goods, since the accrual already credits AP 2000 for them. Matching
+a later invoice bill against the accrual (3-way match / GR-IR clearing)
+is post-v1; the receiving's `accrued_entry_id` is the hook it will match
+against. Receiving requires `procurement:post` (admin in the seeded
+matrix); PO lifecycle (create/edit/submit/close/cancel) requires
+`procurement:write`.
+
 ## Layout
 
 ```
@@ -258,6 +302,8 @@ src/ar.ts          AR: customers, invoices, payments, credit memos (via ledger o
 src/ap.ts          AP: vendors, bills with maker-checker approval, bill payments (via ledger only)
 src/inventory.ts   inventory: items, warehouses, append-only movements,
                    weighted-average costing, COGS posting on issue (via ledger only)
+src/procurement.ts procurement: purchase orders, receivings (stock movement +
+                   AP accrual, atomically, via inventory + ledger only)
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -268,7 +314,7 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–5)
+## Compliance map (Phase 0–6)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·

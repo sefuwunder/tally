@@ -103,6 +103,19 @@ import {
   listMovements,
   InventoryError,
 } from "./inventory";
+import {
+  createPurchaseOrder,
+  getPurchaseOrder,
+  listPurchaseOrders,
+  updatePurchaseOrderDraft,
+  submitPurchaseOrder,
+  closePurchaseOrder,
+  cancelPurchaseOrder,
+  receivePurchaseOrder,
+  getReceiving,
+  listReceivings,
+  ProcurementError,
+} from "./procurement";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -400,6 +413,65 @@ function runInventoryMutation(
   } catch (e) {
     if (e && typeof e === "object" && "__invHttp" in e) {
       return (e as { __invHttp: Response }).__invHttp;
+    }
+    throw e;
+  }
+}
+
+/** Map a ProcurementError to the stable error envelope; LedgerError delegates.
+ *  Receiving calls inventory receiveStock, so InventoryError (e.g. an
+ *  inactive item) must map here too — otherwise it would surface as a 500. */
+function procurementError(e: unknown): Response {
+  if (e instanceof LedgerError) return ledgerError(e);
+  if (e instanceof InventoryError) return inventoryError(e);
+  if (e instanceof ProcurementError) {
+    const status =
+      {
+        validation: 400,
+        over_received: 400,
+        line_mismatch: 400,
+        not_found: 404,
+        not_draft: 409,
+        not_submitted: 409,
+        not_receivable: 409,
+        not_cancellable: 409,
+        already_closed: 409,
+        already_cancelled: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/**
+ * Run produce() for a procurement posting (receiving), honoring
+ * Idempotency-Key like the AR/AP/inventory routes: errors are NOT
+ * recorded, successes replay.
+ */
+function runProcurementMutation(
+  req: Request,
+  db: Database,
+  ctx: Ctx,
+  scope: string,
+  path: string,
+  produce: () => { status: number; body: unknown },
+): Response {
+  const idemKey = req.headers.get("idempotency-key")?.trim().slice(0, 128);
+  const run = (): { status: number; body: unknown } => {
+    try {
+      return produce();
+    } catch (e) {
+      throw { __procHttp: procurementError(e) };
+    }
+  };
+  try {
+    const r = idemKey
+      ? withIdempotency(db, `${scope}:${ctx.user.id}:${idemKey}`, ctx.user.id, "POST", path, run)
+      : { replayed: false, ...run() };
+    return Response.json(r.body, { status: r.status });
+  } catch (e) {
+    if (e && typeof e === "object" && "__procHttp" in e) {
+      return (e as { __procHttp: Response }).__procHttp;
     }
     throw e;
   }
@@ -1971,6 +2043,185 @@ function handleInventory(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** All /api/v1/procurement/* routes (Phase 6: purchase orders, receivings). */
+function handleProcurement(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "procurement", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/procurement/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+  // --- purchase orders ---
+  if (parts[0] === "purchase-orders") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const vendor_id = url.searchParams.get("vendor_id");
+            return jsonResponse(
+              listPurchaseOrders(db, {
+                vendor_id: vendor_id ? parseInt(vendor_id, 10) || undefined : undefined,
+                status: url.searchParams.get("status") ?? undefined,
+              }),
+            );
+          } catch (e) {
+            return procurementError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createPurchaseOrder(
+              db,
+              {
+                vendor_id: num(b.vendor_id) ?? 0,
+                order_date: str(b.order_date) ?? "",
+                expected_date: (b.expected_date ?? null) as string | null,
+                notes: (b.notes ?? null) as string | null,
+                lines: (Array.isArray(b.lines) ? b.lines : []) as {
+                  item_id: number;
+                  quantity_ordered: number;
+                  unit_cost_cents: number;
+                }[],
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return procurementError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "purchase order id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getPurchaseOrder(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "purchase order not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const updated = updatePurchaseOrderDraft(
+              db,
+              id,
+              {
+                vendor_id: num(b.vendor_id),
+                order_date: str(b.order_date),
+                expected_date: b.expected_date === undefined ? undefined : (b.expected_date as string | null),
+                notes: b.notes === undefined ? undefined : (b.notes as string | null),
+                lines: Array.isArray(b.lines)
+                  ? (b.lines as { item_id: number; quantity_ordered: number; unit_cost_cents: number }[])
+                  : undefined,
+              },
+              ctx.user.id,
+            );
+            return jsonResponse(updated);
+          } catch (e) {
+            return procurementError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      const action = parts[2];
+      if (action === "submit" || action === "close" || action === "cancel") {
+        return perm("write", async (_req2, ctx) => {
+          try {
+            const fn =
+              action === "submit"
+                ? submitPurchaseOrder
+                : action === "close"
+                  ? closePurchaseOrder
+                  : cancelPurchaseOrder;
+            return jsonResponse(fn(db, id, ctx.user.id));
+          } catch (e) {
+            return procurementError(e);
+          }
+        })(req);
+      }
+      if (action === "receive") {
+        return perm("post", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          return runProcurementMutation(req2, db, ctx, `po-receive:${id}`, `/api/v1/procurement/purchase-orders/${id}/receive`, () => ({
+            status: 201,
+            body: {
+              data: receivePurchaseOrder(
+                db,
+                id,
+                {
+                  warehouse_id: num(b.warehouse_id) ?? 0,
+                  receiving_date: str(b.receiving_date),
+                  lines: (Array.isArray(b.lines) ? b.lines : []) as {
+                    po_line_id: number;
+                    quantity: number;
+                  }[],
+                },
+                ctx.user.id,
+              ),
+            },
+          }));
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- receivings (read-only surface; created via PO receive) ---
+  if (parts[0] === "receivings") {
+    if (parts.length === 1 && req.method === "GET") {
+      return perm("read", () => {
+        const po_id = url.searchParams.get("po_id");
+        const warehouse_id = url.searchParams.get("warehouse_id");
+        return jsonResponse(
+          listReceivings(db, {
+            po_id: po_id ? parseInt(po_id, 10) || undefined : undefined,
+            warehouse_id: warehouse_id ? parseInt(warehouse_id, 10) || undefined : undefined,
+          }),
+        );
+      })(req);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "receiving id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getReceiving(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "receiving not found", 404);
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -2011,6 +2262,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/inventory/")) {
           return handleInventory(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/procurement/")) {
+          return handleProcurement(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {
