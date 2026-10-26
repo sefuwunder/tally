@@ -116,6 +116,35 @@ import {
   listReceivings,
   ProcurementError,
 } from "./procurement";
+import {
+  createCompany,
+  getCompany,
+  listCompanies,
+  updateCompany,
+  createContact,
+  getContact,
+  listContacts,
+  updateContact,
+  createDeal,
+  getDeal,
+  listDeals,
+  updateDeal,
+  createActivity,
+  getActivity,
+  listActivities,
+  reviewQueue,
+  getCommsReview,
+  reviewActivity,
+  listPrincipals,
+  designatePrincipal,
+  revokePrincipal,
+  createComplaint,
+  getComplaint,
+  listComplaints,
+  acknowledgeComplaint,
+  respondComplaint,
+  CrmError,
+} from "./crm";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -2222,6 +2251,512 @@ function handleProcurement(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** Map a CrmError to the stable error envelope; rethrow anything else. */
+function crmError(e: unknown): Response {
+  if (e instanceof CrmError) {
+    const status =
+      {
+        validation: 400,
+        not_found: 404,
+        self_review: 403,
+        not_principal: 403,
+        not_flagged: 409,
+        already_reviewed: 409,
+        already_principal: 409,
+        state_regression: 409,
+        terminal_stage: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/** All /api/v1/crm/* routes (Phase 7: companies, contacts, deals, activities,
+ *  principal review queue, supervisory personnel, complaints). */
+function handleCrm(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "crm", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/crm/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+  const nul = (v: unknown): string | null =>
+    v === undefined ? null : typeof v === "string" ? v : null;
+  const qint = (name: string): number | undefined => {
+    const v = url.searchParams.get(name);
+    return v ? parseInt(v, 10) || undefined : undefined;
+  };
+
+  // --- companies ---
+  if (parts[0] === "companies") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listCompanies(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createCompany(
+              db,
+              {
+                name: b.name,
+                legal_name: b.legal_name,
+                address: b.address,
+                tax_id: b.tax_id,
+                investment_objectives: b.investment_objectives,
+                authorized_parties: b.authorized_parties,
+                status: b.status,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "company id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getCompany(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "company not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            return jsonResponse(
+              updateCompany(
+                db,
+                id,
+                {
+                  name: b.name,
+                  legal_name: b.legal_name,
+                  address: b.address,
+                  tax_id: b.tax_id,
+                  investment_objectives: b.investment_objectives,
+                  authorized_parties: b.authorized_parties,
+                  status: b.status,
+                },
+                ctx.user.id,
+              ),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- contacts ---
+  if (parts[0] === "contacts") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(
+              listContacts(db, { company_id: qint("company_id"), status: url.searchParams.get("status") ?? undefined }),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createContact(
+              db,
+              {
+                company_id: b.company_id,
+                name: b.name,
+                email: b.email,
+                phone: b.phone,
+                address: b.address,
+                status: b.status,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "contact id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getContact(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "contact not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            return jsonResponse(
+              updateContact(
+                db,
+                id,
+                {
+                  company_id: b.company_id,
+                  name: b.name,
+                  email: b.email,
+                  phone: b.phone,
+                  address: b.address,
+                  status: b.status,
+                },
+                ctx.user.id,
+              ),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- deals ---
+  if (parts[0] === "deals") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(
+              listDeals(db, {
+                company_id: qint("company_id"),
+                contact_id: qint("contact_id"),
+                stage: url.searchParams.get("stage") ?? undefined,
+              }),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createDeal(
+              db,
+              {
+                title: b.title,
+                company_id: b.company_id,
+                contact_id: b.contact_id,
+                stage: b.stage,
+                amount_cents: b.amount_cents,
+                expected_close_date: b.expected_close_date,
+                owner_id: b.owner_id,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "deal id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getDeal(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "deal not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            return jsonResponse(
+              updateDeal(
+                db,
+                id,
+                {
+                  title: b.title,
+                  company_id: b.company_id,
+                  contact_id: b.contact_id,
+                  stage: b.stage,
+                  amount_cents: b.amount_cents,
+                  expected_close_date: b.expected_close_date,
+                  owner_id: b.owner_id,
+                },
+                ctx.user.id,
+              ),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- activities (comms log, read + create only: append-only) ---
+  if (parts[0] === "activities") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const flagged = url.searchParams.get("flagged_for_review");
+            return jsonResponse(
+              listActivities(db, {
+                company_id: qint("company_id"),
+                contact_id: qint("contact_id"),
+                deal_id: qint("deal_id"),
+                flagged_for_review: flagged === null ? undefined : flagged === "1",
+                origin: url.searchParams.get("origin") ?? undefined,
+                direction: url.searchParams.get("direction") ?? undefined,
+              }),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createActivity(
+              db,
+              {
+                direction: b.direction,
+                channel: b.channel,
+                origin: b.origin,
+                subject: b.subject,
+                body: b.body,
+                company_id: b.company_id,
+                contact_id: b.contact_id,
+                deal_id: b.deal_id,
+                flagged_for_review: b.flagged_for_review,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "activity id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getActivity(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "activity not found", 404);
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- comms reviews (principal queue + review) ---
+  if (parts[0] === "comms-reviews") {
+    if (parts.length === 2 && parts[1] === "queue" && req.method === "GET") {
+      return perm("read", () => jsonResponse(reviewQueue(db)))(req);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "activity id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getCommsReview(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "no review for activity", 404);
+      })(req);
+    }
+    if (parts.length === 3 && parts[2] === "review" && req.method === "POST") {
+      // crm:approve is the RBAC gate; is_principal + no-self-review are
+      // enforced inside reviewActivity (F-S3) and surface as 403s.
+      return perm("approve", async (req2, ctx) => {
+        const parsed = await parseJsonBody(req2);
+        if (!parsed.ok) return parsed.response;
+        const b = parsed.body;
+        try {
+          return jsonResponse(
+            reviewActivity(db, id, ctx.user.id, str(b.disposition) ?? "", nul(b.notes)),
+          );
+        } catch (e) {
+          return crmError(e);
+        }
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- supervisory personnel (F-S3) ---
+  if (parts[0] === "principals") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => jsonResponse(listPrincipals(db)))(req);
+      }
+      if (req.method === "POST") {
+        return perm("admin", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = designatePrincipal(
+              db,
+              num(b.user_id) ?? 0,
+              nul(b.title),
+              nul(b.location),
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "user id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "DELETE") {
+      return perm("admin", (_req2, ctx) => {
+        try {
+          return jsonResponse(revokePrincipal(db, id, ctx.user.id));
+        } catch (e) {
+          return crmError(e);
+        }
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- complaints ---
+  if (parts[0] === "complaints") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const overdue = url.searchParams.get("overdue_ack");
+            return jsonResponse(
+              listComplaints(db, {
+                status: url.searchParams.get("status") ?? undefined,
+                overdue_ack: overdue === "1",
+              }),
+            );
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createComplaint(
+              db,
+              {
+                company_id: b.company_id,
+                contact_id: b.contact_id,
+                subject: b.subject,
+                description: b.description,
+                ack_sla_days: b.ack_sla_days,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "complaint id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getComplaint(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "complaint not found", 404);
+      })(req);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      if (parts[2] === "acknowledge") {
+        return perm("write", async (_req2, ctx) => {
+          try {
+            return jsonResponse(acknowledgeComplaint(db, id, ctx.user.id));
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+      if (parts[2] === "respond") {
+        return perm("write", async (_req2, ctx) => {
+          try {
+            return jsonResponse(respondComplaint(db, id, ctx.user.id));
+          } catch (e) {
+            return crmError(e);
+          }
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -2265,6 +2800,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/procurement/")) {
           return handleProcurement(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/crm/")) {
+          return handleCrm(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {

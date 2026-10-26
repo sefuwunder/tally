@@ -286,6 +286,39 @@ against. Receiving requires `procurement:post` (admin in the seeded
 matrix); PO lifecycle (create/edit/submit/close/cancel) requires
 `procurement:write`.
 
+CRM + supervision (Phase 7): companies, contacts, deals, an immutable
+communications log, a principal review queue, supervisory personnel,
+and complaints. Companies carry the FINRA 4512 field set (name,
+address, tax ID, investment objectives as a free-form profile field,
+authorized parties); creating or updating a company with a required
+4512 field missing or cleared is a 400 that names the missing fields
+(the exact 4512 element list still carries the matrix's [verify] flag
+against primary rule text, so validation names fields rather than
+claiming a confirmed list). Deals run lead → qualified → proposal →
+negotiation → won/lost, and won/lost are terminal (`terminal_stage`,
+409). Activities are the comms log and are trigger-append-only: no
+UPDATE, no DELETE, ever — review evidence lives in a separate
+`comms_reviews` row, never as an edit to the activity. A flagged
+activity sits in `GET /api/v1/crm/comms-reviews/queue` until a
+principal reviews it; review requires `crm:approve` AND the
+`is_principal` flag on the reviewer, and a principal reviewing their
+own comm is refused (`self_review`, 403 — no self-supervision,
+3110(b)(6)); a reviewed activity leaves the queue, and re-review is
+`already_reviewed` (409). AI-agent-origin activities are flagged
+automatically with `supervision_status='unreviewed'` (F-S4) — they
+enter the queue whether or not the caller flagged them. Supervisory
+personnel are users with `is_principal` + title/location, designated
+and revoked via `POST/DELETE /api/v1/crm/principals` (`crm:admin`,
+audited). Complaints run received → acknowledged → responded, with
+timestamps at each step; any other transition is `state_regression`
+(409), complaint content is trigger-immutable (only status + its
+timestamps move), and an unacknowledged complaint past its ack SLA
+(default 7 calendar days, per-complaint override) reports
+`acknowledged_overdue` and surfaces under `?overdue_ack=1`. Honesty
+note: company tax IDs are stored in clear in v1, like AR/AP contact
+details — the H-T4 field-level encryption for tax IDs lands with Phase
+8 HR PII work, which is the phase that introduces encrypted columns.
+
 ## Layout
 
 ```
@@ -304,6 +337,9 @@ src/inventory.ts   inventory: items, warehouses, append-only movements,
                    weighted-average costing, COGS posting on issue (via ledger only)
 src/procurement.ts procurement: purchase orders, receivings (stock movement +
                    AP accrual, atomically, via inventory + ledger only)
+src/crm.ts         CRM + supervision: companies (4512 set), contacts, deals,
+                   immutable activities, principal review queue, principals,
+                   complaints lifecycle
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -314,13 +350,21 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–6)
+## Compliance map (Phase 0–7)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
 H-A2 access management · H-A3 password management · H-A5 6y documentation
 retention · F-R1 books/records substrate · F-R2 format/media · F-R3
 immutability + WORM path · F-R4 automatic verification, export/download ·
-F-R7 retention periods · F-S supervision angle (AP maker-checker approval
-with recorded approver). Full citations in the goal workspace
-`compliance-matrix.md`.
+F-R7 retention periods · F-R8 customer account information (4512 field
+set + completeness validation) · F-R9 written complaints records ·
+F-R10 AI-agent comms as retention records (forward-looking: logged with
+origin, flagged, retained — no agent exists) · F-S1 principal review of
+correspondence, evidenced in writing · F-S2 complaint capture/
+acknowledge/respond · F-S3 supervisory personnel documentation, no
+self-supervision · F-S4 AI comms supervision hooks · F-S supervision
+angle (AP maker-checker approval with recorded approver). 2210 surface:
+comms are logged and review-queued; content-standard adjudication and
+filing determinations remain procedural/legal, not code. Full citations
+in the goal workspace `compliance-matrix.md`.

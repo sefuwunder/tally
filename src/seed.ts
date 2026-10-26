@@ -32,7 +32,10 @@ export const PERMISSION_MATRIX: Record<string, Record<string, string[]>> = {
     ap: ["read", "write", "post", "approve"],
     inventory: ["read", "write", "post"],
     procurement: ["read", "write"],
-    crm: ["read", "write"],
+    // crm:approve is the principal-review permission (Phase 7); the
+    // is_principal flag on the user is the second gate — approve alone
+    // does not make a reviewer a principal (F-S3).
+    crm: ["read", "write", "approve"],
     hr: ["read"],
     reports: ["read", "write"],
     documents: ["read", "write"],
@@ -112,6 +115,7 @@ export const ADMIN_PASSWORD = "Changeme-123456"; // must-change on first login
 export const RETENTION_SEED: Record<string, number> = {
   journal: 6,
   comms: 6,
+  crm: 6,
   hr: 6,
   audit: 6,
   document: 6,
@@ -162,10 +166,12 @@ export async function seed(db: Database): Promise<void> {
     const adminRoleId = roleId("admin");
     const existing = db.query("SELECT id FROM users WHERE email = ?").get(ADMIN_EMAIL);
     if (!existing) {
+      // Seeded admin is a designated principal (F-S3) so the review
+      // queue is operable out of the box; self-review is still blocked.
       db.query(
         `INSERT INTO users
-           (email, pw_hash, role_id, must_change_pw, created_at, updated_at)
-         VALUES (?, ?, ?, 1, ?, ?)`,
+           (email, pw_hash, role_id, must_change_pw, is_principal, title, created_at, updated_at)
+         VALUES (?, ?, ?, 1, 1, 'Administrator', ?, ?)`,
       ).run(ADMIN_EMAIL, pwHash, adminRoleId, now, now);
       appendAudit(db, {
         actor_id: null,

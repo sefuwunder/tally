@@ -259,7 +259,8 @@ describe("retention engine", () => {
     expect(byType.journal.status).toBe("covered");
     expect(byType.document.years).toBe(6);
     expect(byType.audit.years).toBe(6);
-    expect(byType.comms.status).toBe("pending_module"); // phase 7 not built yet
+    expect(byType.comms.status).toBe("covered"); // phase 7: activities table
+    expect(byType.crm.status).toBe("covered"); // phase 7: companies table
     expect(byType.hr.status).toBe("pending_module"); // phase 8 not built yet
     const docTypes = Object.fromEntries(
       json.data.document_types.map((t: any) => [t.doc_type, t.years]),
