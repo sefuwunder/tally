@@ -163,6 +163,18 @@ import {
   payPayRun,
   HrError,
 } from "./hr";
+import {
+  profitLoss,
+  balanceSheet,
+  cashFlow,
+  computeReport,
+  pinReport,
+  getReportRun,
+  listReportRuns,
+  reproduceReportRun,
+  ReportError,
+  type ReportParams,
+} from "./reports";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -522,6 +534,132 @@ function runProcurementMutation(
     }
     throw e;
   }
+}
+
+/** Map a ReportError to the stable error envelope; rethrow anything else. */
+function reportError(e: unknown): Response {
+  if (e instanceof ReportError) {
+    const status =
+      {
+        validation: 400,
+        unknown_report: 400,
+        not_found: 404,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/** GET/POST /api/v1/reports/* — P&L, balance sheet, cash flow, aging, pinned runs. */
+function handleReports(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "reports", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/reports/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const paramsFromQuery = (): ReportParams => {
+    const p: ReportParams = {};
+    const period = url.searchParams.get("period_id");
+    if (period !== null) p.period_id = parseInt(period, 10);
+    const from = url.searchParams.get("from");
+    if (from !== null) p.from = from;
+    const to = url.searchParams.get("to");
+    if (to !== null) p.to = to;
+    const asOf = url.searchParams.get("as_of");
+    if (asOf !== null) p.as_of = asOf;
+    return p;
+  };
+
+  // --- computed reports (read-only; no state, nothing to audit) ---
+  if (parts.length === 1 && req.method === "GET") {
+    const computed: Record<string, (db: Database, p: ReportParams) => unknown> = {
+      "profit-loss": profitLoss,
+      "balance-sheet": balanceSheet,
+      "cash-flow": cashFlow,
+      "ar-aging": (d, p) => computeReport(d, "ar_aging", p),
+      "ap-aging": (d, p) => computeReport(d, "ap_aging", p),
+    };
+    const fn = computed[parts[0]];
+    if (fn) {
+      return perm("read", () => {
+        try {
+          return jsonResponse(fn(db, paramsFromQuery()));
+        } catch (e) {
+          return reportError(e);
+        }
+      })(req);
+    }
+  }
+
+  // --- pinned report runs ---
+  if (parts[0] === "report-runs") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            const type = url.searchParams.get("report_type") ?? undefined;
+            const page = parseQueryInt(url, "page", 1);
+            const perPage = parseQueryInt(url, "per_page", 50);
+            return jsonResponse(
+              listReportRuns(db, { report_type: type, page, per_page: perPage }),
+            );
+          } catch (e) {
+            return reportError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const run = pinReport(
+              db,
+              typeof b.report_type === "string" ? b.report_type : "",
+              (b.params ?? {}) as ReportParams,
+              ctx.user.id,
+            );
+            return Response.json({ data: run }, { status: 201 });
+          } catch (e) {
+            return reportError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "report run id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const run = getReportRun(db, id);
+        return run ? jsonResponse(run) : errorResponse("not_found", "report run not found", 404);
+      })(req);
+    }
+    if (parts.length === 3 && parts[2] === "reproduce" && req.method === "GET") {
+      return perm("read", () => {
+        try {
+          return jsonResponse(reproduceReportRun(db, id));
+        } catch (e) {
+          return reportError(e);
+        }
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
 }
 
 /** Map document/retention/compliance errors to the envelope; rethrow others. */
@@ -3161,6 +3299,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/hr/")) {
           return handleHr(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/reports/")) {
+          return handleReports(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {

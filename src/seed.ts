@@ -117,6 +117,7 @@ export const RETENTION_SEED: Record<string, number> = {
   comms: 6,
   crm: 6,
   hr: 6,
+  report: 6,
   audit: 6,
   document: 6,
 };

@@ -42,7 +42,7 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–8 surface)
+## API (Phase 0–9 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
@@ -340,6 +340,36 @@ paid run with a reversing journal entry + a new run. Open follow-up
 from Phase 7: company tax IDs are still stored in clear — Phase 8
 scoped H-T4 to employee PII.
 
+Reporting (Phase 9): P&L, balance sheet, cash flow, AR/AP aging, and
+pinned report runs — all computed from posted journal lines only, so
+reports can never disagree with the books they summarize. P&L and cash
+flow take a fiscal period (`period_id`) or an explicit `from`/`to`
+window (neither is defaulted, so every report states its window);
+balance sheet and aging take `as_of` (default today). The balance
+sheet reports equity accounts PLUS net income to date, so the
+identity assets == liabilities + equity is checkable in the output
+itself. Cash flow is built entry-by-entry over the 10xx cash family
+(seeded 1000/1010): each entry's cash movement (debits − credits) is
+classified by its non-cash counterparts — equity → financing, 15xx
+fixed assets → investing, everything else → operating — with
+beginning cash from pre-window activity and ending cash reconciled to
+the GL cash balance. Aging buckets by days past due at `as_of`
+(current, 1–30, 31–60, 61–90, 90+) per customer/vendor, and reconcile
+honestly: total_open − total_unapplied == the GL control balance
+(1100/2000), because a payment credits the control account for its
+full amount while only the applied part reduces open documents — the
+unapplied remainder is reported as the wedge, not hidden. A pinned
+run (`POST /api/v1/reports/report-runs`, `reports:write`) stores the
+report type, the exact params, the canonical-JSON output, its sha256,
+and the generating user, audited as `report.pin`; pinned runs are
+trigger-immutable (no UPDATE/DELETE). `GET .../report-runs/:id/
+reproduce` re-runs the stored params and compares hashes — a mismatch
+is not an error, it is the honest signal that the books moved since
+the pin. V1 conventions, stated not hidden: cash = 10xx asset family,
+investing = 15xx counterparts, and the aging GL balance is read from
+the seeded 1100/2000 control accounts (null + `reconciles: null` if a
+custom chart drops them).
+
 ## Layout
 
 ```
@@ -363,6 +393,9 @@ src/crm.ts         CRM + supervision: companies (4512 set), contacts, deals,
                    complaints lifecycle
 src/hr.ts          HR/payroll: employees (encrypted PII), deduction types,
                    pay runs with maker-checker approval + summary posting
+src/reports.ts     reporting: P&L, balance sheet, cash flow, AR/AP aging
+                   with GL reconciliation, pinned report_runs (sha256 +
+                   reproduce)
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -373,13 +406,14 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–8)
+## Compliance map (Phase 0–9)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
 H-A2 access management · H-A3 password management · H-A5 6y documentation
 retention · F-R1 books/records substrate · F-R2 format/media · F-R3
-immutability + WORM path · F-R4 automatic verification, export/download ·
+immutability + WORM path · F-R4 automatic verification, export/download,
+pinned report reproduction (sha256) ·
 F-R7 retention periods · F-R8 customer account information (4512 field
 set + completeness validation) · F-R9 written complaints records ·
 F-R10 AI-agent comms as retention records (forward-looking: logged with
