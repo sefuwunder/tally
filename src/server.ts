@@ -145,6 +145,24 @@ import {
   respondComplaint,
   CrmError,
 } from "./crm";
+import {
+  createEmployee,
+  getEmployee,
+  listEmployees,
+  updateEmployee,
+  createDeductionType,
+  getDeductionType,
+  listDeductionTypes,
+  createPayRun,
+  getPayRun,
+  listPayRuns,
+  addPayLine,
+  updatePayLineDraft,
+  removePayLine,
+  approvePayRun,
+  payPayRun,
+  HrError,
+} from "./hr";
 import { appendAudit } from "./audit";
 import {
   errorResponse,
@@ -2757,6 +2775,343 @@ function handleCrm(
   return errorResponse("not_found", "not found", 404);
 }
 
+/** Map an HrError to the stable error envelope; LedgerError delegates to ledgerError. */
+function hrError(e: unknown): Response {
+  if (e instanceof LedgerError) return ledgerError(e);
+  if (e instanceof HrError) {
+    const status =
+      {
+        validation: 400,
+        deductions_exceed_gross: 400,
+        not_found: 404,
+        self_approval: 403,
+        not_draft: 409,
+        not_approved: 409,
+        already_approved: 409,
+        already_paid: 409,
+        empty_run: 409,
+        duplicate_line: 409,
+        employee_inactive: 409,
+      }[e.code] ?? 400;
+    return errorResponse(e.code, e.message, status);
+  }
+  throw e;
+}
+
+/**
+ * Run produce() for an HR posting (pay), honoring Idempotency-Key like the
+ * AR/AP/inventory/procurement routes: errors are NOT recorded, successes
+ * replay. Approve is a state transition, not a posting, so it is NOT
+ * idempotency-wrapped (same rule as bill approve / PO submit).
+ */
+function runHrMutation(
+  req: Request,
+  db: Database,
+  ctx: Ctx,
+  scope: string,
+  path: string,
+  produce: () => { status: number; body: unknown },
+): Response {
+  const idemKey = req.headers.get("idempotency-key")?.trim().slice(0, 128);
+  const run = (): { status: number; body: unknown } => {
+    try {
+      return produce();
+    } catch (e) {
+      throw { __hrHttp: hrError(e) };
+    }
+  };
+  try {
+    const r = idemKey
+      ? withIdempotency(db, `${scope}:${ctx.user.id}:${idemKey}`, ctx.user.id, "POST", path, run)
+      : { replayed: false, ...run() };
+    return Response.json(r.body, { status: r.status });
+  } catch (e) {
+    if (e && typeof e === "object" && "__hrHttp" in e) {
+      return (e as { __hrHttp: Response }).__hrHttp;
+    }
+    throw e;
+  }
+}
+
+/** All /api/v1/hr/* routes (Phase 8: employees with encrypted PII,
+ *  deduction types, pay runs with maker-checker approval + summary posting). */
+function handleHr(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  url: URL,
+): Promise<Response> | Response {
+  const perm = (
+    action: string,
+    handler: (req: Request, ctx: Ctx, url: URL) => Promise<Response> | Response,
+  ): Handler =>
+    withPerm(db, cfg, "hr", action, (req2, ctx) => {
+      if (!ctx) return errorResponse("unauthorized", "missing session", 401);
+      return handler(req2, ctx, url);
+    });
+
+  const sub = url.pathname.slice("/api/v1/hr/".length);
+  const parts = sub.split("/").filter((p) => p !== "");
+  const qint = (name: string): number | undefined => {
+    const v = url.searchParams.get(name);
+    return v ? parseInt(v, 10) || undefined : undefined;
+  };
+
+  // --- employees (PII encrypted at rest; HTTP view shows ssn_last4 only) ---
+  if (parts[0] === "employees") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listEmployees(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = await createEmployee(
+              db,
+              {
+                first_name: b.first_name,
+                last_name: b.last_name,
+                email: b.email,
+                status: b.status,
+                hire_date: b.hire_date,
+                pay_type: b.pay_type,
+                base_pay_cents: b.base_pay_cents,
+                ssn: b.ssn,
+                date_of_birth: b.date_of_birth,
+                bank_account: b.bank_account,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "employee id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getEmployee(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "employee not found", 404);
+        })(req);
+      }
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            return jsonResponse(
+              await updateEmployee(
+                db,
+                id,
+                {
+                  first_name: b.first_name,
+                  last_name: b.last_name,
+                  email: b.email,
+                  status: b.status,
+                  hire_date: b.hire_date,
+                  pay_type: b.pay_type,
+                  base_pay_cents: b.base_pay_cents,
+                  ssn: b.ssn,
+                  date_of_birth: b.date_of_birth,
+                  bank_account: b.bank_account,
+                },
+                ctx.user.id,
+              ),
+            );
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- deduction types ---
+  if (parts[0] === "deduction-types") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const active = url.searchParams.get("active");
+          return jsonResponse(
+            listDeductionTypes(db, { active: active === null ? undefined : active === "1" }),
+          );
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createDeductionType(
+              db,
+              {
+                code: b.code,
+                name: b.name,
+                kind: b.kind,
+                percent_bps: b.percent_bps,
+                amount_cents: b.amount_cents,
+                active: b.active,
+              },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "deduction type id must be a positive integer", 400);
+    if (parts.length === 2 && req.method === "GET") {
+      return perm("read", () => {
+        const v = getDeductionType(db, id);
+        return v ? jsonResponse(v) : errorResponse("not_found", "deduction type not found", 404);
+      })(req);
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  // --- pay runs ---
+  if (parts[0] === "pay-runs") {
+    if (parts.length === 1) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          try {
+            return jsonResponse(listPayRuns(db, { status: url.searchParams.get("status") ?? undefined }));
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      if (req.method === "POST") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const created = createPayRun(
+              db,
+              { period_start: b.period_start, period_end: b.period_end, pay_date: b.pay_date },
+              ctx.user.id,
+            );
+            return Response.json({ data: created }, { status: 201 });
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "pay run id must be a positive integer", 400);
+    if (parts.length === 2) {
+      if (req.method === "GET") {
+        return perm("read", () => {
+          const v = getPayRun(db, id);
+          return v ? jsonResponse(v) : errorResponse("not_found", "pay run not found", 404);
+        })(req);
+      }
+      return errorResponse("not_found", "not found", 404);
+    }
+    if (parts.length === 3 && req.method === "POST") {
+      if (parts[2] === "lines") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            const line = addPayLine(
+              db,
+              id,
+              { employee_id: b.employee_id, gross_cents: b.gross_cents, deduction_codes: b.deduction_codes },
+              ctx.user.id,
+            );
+            return Response.json({ data: line }, { status: 201 });
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      if (parts[2] === "approve") {
+        return perm("approve", async (req2, ctx) => {
+          await parseJsonBodyLenient(req2);
+          try {
+            return jsonResponse(approvePayRun(db, id, ctx.user.id));
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      if (parts[2] === "pay") {
+        return perm("post", async (req2, ctx) => {
+          await parseJsonBodyLenient(req2);
+          return runHrMutation(req2, db, ctx, "hr-pay", `/api/v1/hr/pay-runs/${id}/pay`, () => {
+            const paid = payPayRun(db, id, ctx.user.id);
+            return { status: 200, body: { data: paid } };
+          });
+        })(req);
+      }
+    }
+    if (parts.length === 4 && parts[2] === "lines") {
+      const lineId = parseIdParam(parts, 3);
+      if (lineId === null) return errorResponse("validation", "pay line id must be a positive integer", 400);
+      if (req.method === "PATCH") {
+        return perm("write", async (req2, ctx) => {
+          const parsed = await parseJsonBody(req2);
+          if (!parsed.ok) return parsed.response;
+          const b = parsed.body;
+          try {
+            return jsonResponse(
+              updatePayLineDraft(
+                db,
+                id,
+                lineId,
+                { employee_id: b.employee_id, gross_cents: b.gross_cents, deduction_codes: b.deduction_codes },
+                ctx.user.id,
+              ),
+            );
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+      if (req.method === "DELETE") {
+        return perm("write", (_req2, ctx) => {
+          try {
+            removePayLine(db, id, lineId, ctx.user.id);
+            return jsonResponse({ removed: true });
+          } catch (e) {
+            return hrError(e);
+          }
+        })(req);
+      }
+    }
+    return errorResponse("not_found", "not found", 404);
+  }
+
+  return errorResponse("not_found", "not found", 404);
+}
+
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
   return Bun.serve({
     port: opts.port ?? 0,
@@ -2803,6 +3158,9 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
         }
         if (path.startsWith("/api/v1/crm/")) {
           return handleCrm(req, db, cfg, url);
+        }
+        if (path.startsWith("/api/v1/hr/")) {
+          return handleHr(req, db, cfg, url);
         }
         return errorResponse("not_found", "not found", 404);
       } catch (e) {

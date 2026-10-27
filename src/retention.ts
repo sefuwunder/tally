@@ -104,6 +104,7 @@ const COVERED_TABLES: Record<string, string> = {
   audit: "audit_log",
   comms: "activities",
   crm: "companies",
+  hr: "employees",
 };
 
 function countWhere(db: Database, table: string, where = "", ...params: string[]): number {

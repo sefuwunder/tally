@@ -42,7 +42,7 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–6 surface)
+## API (Phase 0–8 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
@@ -316,8 +316,29 @@ timestamps move), and an unacknowledged complaint past its ack SLA
 (default 7 calendar days, per-complaint override) reports
 `acknowledged_overdue` and surfaces under `?overdue_ack=1`. Honesty
 note: company tax IDs are stored in clear in v1, like AR/AP contact
-details — the H-T4 field-level encryption for tax IDs lands with Phase
-8 HR PII work, which is the phase that introduces encrypted columns.
+details — the H-T4 field-level encryption for tax IDs was expected to
+land with Phase 8, but Phase 8 scoped encryption to employee PII
+only, so company tax IDs remain in clear (open follow-up, not silently
+done).
+
+HR / payroll (Phase 8): employees, deduction types, pay runs. SSN,
+date of birth, and bank account are stored ONLY as AES-256-GCM blobs
+(`ssn_enc`/`dob_enc`/`bank_account_enc`, via the Phase 0 mechanism);
+the HTTP surface never returns a blob or a plaintext secret — list/get
+return `ssn_last4` (display only), and audit rows for employees carry
+`employee_no` + status only. Deduction types are percent-of-gross
+(basis points, rounded half-up) or fixed amounts; a pay line's total
+deductions may never exceed its gross. Pay runs move draft → approved
+→ paid under maker-checker (approver ≠ creator, `self_approval`, 403,
+approver recorded); paying posts ONE summary journal entry (Dr Wages
+6000 / Cr Cash 1000 / Cr Payroll Liabilities 2200, posted_on =
+pay_date) — per-employee detail never hits the GL directly, and a
+zero-gross run posts no journal entry (same zero rule as inventory).
+Pay lines freeze once the run leaves draft (triggers), and a pay run's
+content columns are trigger-immutable. No pay-run void in v1: correct a
+paid run with a reversing journal entry + a new run. Open follow-up
+from Phase 7: company tax IDs are still stored in clear — Phase 8
+scoped H-T4 to employee PII.
 
 ## Layout
 
@@ -340,6 +361,8 @@ src/procurement.ts procurement: purchase orders, receivings (stock movement +
 src/crm.ts         CRM + supervision: companies (4512 set), contacts, deals,
                    immutable activities, principal review queue, principals,
                    complaints lifecycle
+src/hr.ts          HR/payroll: employees (encrypted PII), deduction types,
+                   pay runs with maker-checker approval + summary posting
 src/documents.ts   WORM content-addressed document store
 src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
@@ -350,7 +373,7 @@ migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–7)
+## Compliance map (Phase 0–8)
 
 H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
 H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
