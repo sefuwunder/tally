@@ -9,9 +9,14 @@ import {
   login,
   logout,
   authenticate,
+  breakGlassLogin,
+  listBreakGlassEvents,
+  reviewBreakGlassEvent,
   sessionConfigFromEnv,
   type SessionConfig,
 } from "./auth";
+import { createRateLimiter, type RateLimiter } from "./ratelimit";
+import { generateTotpSecret, otpauthUri, verifyTotp } from "./totp";
 import { verifyChain } from "./audit";
 import { can } from "./rbac";
 import {
@@ -195,10 +200,43 @@ export interface ServeOptions {
   tls?: { cert: Bun.BunFile; key: Bun.BunFile };
 }
 
-async function handleLogin(req: Request, db: Database, cfg: SessionConfig): Promise<Response> {
+/** Per-IP auth rate limit: 429 + Retry-After + auth.rate_limited audit row. */
+function checkAuthRateLimit(
+  req: Request,
+  db: Database,
+  limiter: RateLimiter,
+  path: string,
+): Response | null {
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+  const r = limiter.allow(ip);
+  if (r.allowed) return null;
+  appendAudit(db, {
+    actor_id: null,
+    action: "auth.rate_limited",
+    entity_type: "user",
+    entity_id: null,
+    after: { ip, path },
+  });
+  const res = errorResponse("rate_limited", "too many authentication attempts; try again later", 429);
+  res.headers.set("Retry-After", String(r.retryAfterSeconds));
+  return res;
+}
+
+async function handleLogin(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  limiter: RateLimiter,
+): Promise<Response> {
+  const limited = checkAuthRateLimit(req, db, limiter, "/api/v1/auth/login");
+  if (limited) return limited;
   const parsed = await parseJsonBody(req);
   if (!parsed.ok) return parsed.response;
-  const { email, password } = parsed.body as { email?: unknown; password?: unknown };
+  const { email, password, totp_code } = parsed.body as {
+    email?: unknown;
+    password?: unknown;
+    totp_code?: unknown;
+  };
   const result = await login(
     db,
     typeof email === "string" ? email : "",
@@ -206,6 +244,7 @@ async function handleLogin(req: Request, db: Database, cfg: SessionConfig): Prom
     {
       ip: req.headers.get("x-forwarded-for") ?? null,
       userAgent: req.headers.get("user-agent")?.slice(0, 256) ?? null,
+      totpCode: typeof totp_code === "string" ? totp_code : null,
     },
     cfg,
   );
@@ -217,7 +256,157 @@ async function handleLogin(req: Request, db: Database, cfg: SessionConfig): Prom
     token: result.token,
     expires_at: result.expires_at,
     must_change_password: result.must_change_password,
+    mfa_enrollment_required: result.mfa_enrollment_required,
   });
+}
+
+/** POST /api/v1/auth/break-glass — admin-only emergency login (Phase 10). */
+async function handleBreakGlass(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  limiter: RateLimiter,
+): Promise<Response> {
+  const limited = checkAuthRateLimit(req, db, limiter, "/api/v1/auth/break-glass");
+  if (limited) return limited;
+  const parsed = await parseJsonBody(req);
+  if (!parsed.ok) return parsed.response;
+  const { email, password, justification, totp_code } = parsed.body as {
+    email?: unknown;
+    password?: unknown;
+    justification?: unknown;
+    totp_code?: unknown;
+  };
+  const result = await breakGlassLogin(
+    db,
+    typeof email === "string" ? email : "",
+    typeof password === "string" ? password : "",
+    typeof justification === "string" ? justification : "",
+    {
+      ip: req.headers.get("x-forwarded-for") ?? null,
+      userAgent: req.headers.get("user-agent")?.slice(0, 256) ?? null,
+      totpCode: typeof totp_code === "string" ? totp_code : null,
+    },
+    cfg,
+  );
+  if (!result.ok) {
+    const status =
+      result.code === "validation" ? 400 : result.code === "forbidden" ? 403 : 401;
+    return errorResponse(result.code, result.message, status);
+  }
+  return Response.json({
+    token: result.token,
+    expires_at: result.expires_at,
+    break_glass: true,
+    break_glass_event_id: result.event_id,
+  });
+}
+
+// --- TOTP enrollment (Phase 10) --------------------------------------------
+// Pending secrets live ONLY in this server instance's memory, keyed by
+// user id, 10-minute expiry, single-use. Nothing is written to the DB
+// (and nothing secret is audited) until confirm() verifies a code.
+// Confirm also accepts an explicit `secret` (the one enroll returned)
+// so a client that kept the secret can complete enrollment even if
+// the server restarted between enroll and confirm.
+
+interface PendingTotp {
+  secret: string;
+  expiresAt: number;
+}
+
+function handleTotpEnroll(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  pending: Map<number, PendingTotp>,
+): Response {
+  const auth = authenticate(db, getBearerToken(req), cfg);
+  if (!auth.ok) return errorResponse(auth.code, auth.message, 401);
+  const secret = generateTotpSecret();
+  pending.set(auth.user.id, { secret, expiresAt: Date.now() + 10 * 60 * 1000 });
+  appendAudit(db, {
+    actor_id: auth.user.id,
+    action: "auth.totp_enroll_started",
+    entity_type: "user",
+    entity_id: auth.user.id,
+    after: { enrolled: false }, // never the secret
+  });
+  return jsonResponse({ secret, otpauth_uri: otpauthUri(secret, auth.user.email) });
+}
+
+async function handleTotpConfirm(
+  req: Request,
+  db: Database,
+  cfg: SessionConfig,
+  pending: Map<number, PendingTotp>,
+): Promise<Response> {
+  const auth = authenticate(db, getBearerToken(req), cfg);
+  if (!auth.ok) return errorResponse(auth.code, auth.message, 401);
+  const parsed = await parseJsonBody(req);
+  if (!parsed.ok) return parsed.response;
+  const { code, secret } = parsed.body as { code?: unknown; secret?: unknown };
+  if (typeof code !== "string") {
+    return errorResponse("validation", "code is required", 400);
+  }
+  let candidate: string | null = null;
+  if (typeof secret === "string" && secret) {
+    candidate = secret;
+  } else {
+    const p = pending.get(auth.user.id);
+    if (p && p.expiresAt > Date.now()) candidate = p.secret;
+  }
+  if (!candidate) {
+    return errorResponse("validation", "no pending enrollment; enroll first", 400);
+  }
+  if (!verifyTotp(candidate, code)) {
+    return errorResponse("totp_invalid", "invalid TOTP code", 401);
+  }
+  pending.delete(auth.user.id);
+  db.transaction(() => {
+    db.query("UPDATE users SET totp_secret = ?, mfa_required = 1, updated_at = ? WHERE id = ?").run(
+      candidate,
+      new Date().toISOString(),
+      auth.user.id,
+    );
+    appendAudit(db, {
+      actor_id: auth.user.id,
+      action: "auth.totp_enabled",
+      entity_type: "user",
+      entity_id: auth.user.id,
+      after: { mfa_required: true }, // never the secret or code
+    });
+  })();
+  return jsonResponse({ mfa_enabled: true });
+}
+
+async function handleTotpDisable(req: Request, db: Database, cfg: SessionConfig): Promise<Response> {
+  const auth = authenticate(db, getBearerToken(req), cfg);
+  if (!auth.ok) return errorResponse(auth.code, auth.message, 401);
+  const parsed = await parseJsonBody(req);
+  if (!parsed.ok) return parsed.response;
+  const { password } = parsed.body as { password?: unknown };
+  if (typeof password !== "string" || !password) {
+    return errorResponse("validation", "password is required", 400);
+  }
+  const pwOk = await Bun.password.verify(password, auth.user.pw_hash);
+  if (!pwOk) {
+    return errorResponse("invalid_credentials", "invalid password", 401);
+  }
+  db.transaction(() => {
+    db.query("UPDATE users SET totp_secret = NULL, mfa_required = 0, updated_at = ? WHERE id = ?").run(
+      new Date().toISOString(),
+      auth.user.id,
+    );
+    appendAudit(db, {
+      actor_id: auth.user.id,
+      action: "auth.totp_disabled",
+      entity_type: "user",
+      entity_id: auth.user.id,
+      after: { mfa_required: false },
+    });
+  })();
+  return jsonResponse({ mfa_enabled: false });
 }
 
 function handleLogout(req: Request, db: Database, cfg: SessionConfig): Response {
@@ -234,13 +423,16 @@ function handleLogout(req: Request, db: Database, cfg: SessionConfig): Response 
 function handleMe(req: Request, db: Database, cfg: SessionConfig): Response {
   const auth = authenticate(db, getBearerToken(req), cfg);
   if (!auth.ok) return errorResponse(auth.code, auth.message, 401);
-  const { pw_hash: _pw, ...safe } = auth.user as Record<string, unknown>;
+  const { pw_hash: _pw, totp_secret: _totp, ...safe } = auth.user as Record<string, unknown>;
   void _pw;
+  void _totp;
   return jsonResponse({
     id: safe.id,
     email: safe.email,
     role: (auth.user as unknown as { role_name: string }).role_name,
     must_change_password: auth.user.must_change_pw === 1,
+    mfa_enabled: auth.user.mfa_required === 1,
+    break_glass: auth.session.break_glass === 1,
     session_expires_at: auth.session.expires_at,
   });
 }
@@ -1247,7 +1439,7 @@ function handleDocuments(
 }
 
 /** All /api/v1/compliance/* routes beyond audit-log (F-R4). */
-function handleCompliance(
+async function handleCompliance(
   req: Request,
   db: Database,
   cfg: SessionConfig,
@@ -1263,6 +1455,35 @@ function handleCompliance(
     });
 
   const sub = url.pathname.slice("/api/v1/compliance/".length);
+
+  // --- break-glass dashboard alert (Phase 10, H-A4/F-R5) ---
+  if (sub === "break-glass" && req.method === "GET") {
+    return perm("read", () => {
+      const statusParam = url.searchParams.get("status") ?? "unreviewed";
+      if (statusParam !== "unreviewed" && statusParam !== "reviewed" && statusParam !== "all") {
+        return errorResponse("validation", "status must be unreviewed, reviewed, or all", 400);
+      }
+      return jsonResponse(listBreakGlassEvents(db, { status: statusParam }));
+    })(req);
+  }
+  if (sub.startsWith("break-glass/") && sub.endsWith("/review") && req.method === "POST") {
+    const parts = sub.split("/");
+    const id = parseIdParam(parts, 1);
+    if (id === null) return errorResponse("validation", "break-glass event id must be a positive integer", 400);
+    // Reviewer gate: admin role OR supervisory principal (is_principal) —
+    // deliberately NOT audit:admin, so a principal who is not an admin
+    // can still review (auditor is read-only and cannot review).
+    const auth = authenticate(db, getBearerToken(req), cfg);
+    if (!auth.ok) return errorResponse(auth.code, auth.message, 401);
+    if (auth.user.role_name !== "admin" && auth.user.is_principal !== 1) {
+      return errorResponse("forbidden", "break-glass review requires admin role or principal status", 403);
+    }
+    const parsed = await parseJsonBodyLenient(req);
+    if (!parsed.ok) return parsed.response;
+    const reviewed = reviewBreakGlassEvent(db, id, auth.user.id);
+    if (!reviewed) return errorResponse("not_found", "break-glass event not found", 404);
+    return jsonResponse(reviewed);
+  }
 
   if (sub === "retention-report" && req.method === "GET") {
     return perm("read", () => jsonResponse(retentionReport(db)))(req);
@@ -3251,6 +3472,10 @@ function handleHr(
 }
 
 export function createServer(db: Database, cfg: SessionConfig, opts: ServeOptions = {}) {
+  // Per-server rate limiter + TOTP pending store: isolated per server
+  // instance, so test servers never share buckets or enrollments.
+  const authLimiter = createRateLimiter(cfg.authRateLimitPerMinute ?? 20);
+  const totpPending = new Map<number, PendingTotp>();
   return Bun.serve({
     port: opts.port ?? 0,
     tls: opts.tls,
@@ -3262,7 +3487,19 @@ export function createServer(db: Database, cfg: SessionConfig, opts: ServeOption
           return jsonResponse({ status: "ok", name: "tally", version: TALLY_VERSION });
         }
         if (path === "/api/v1/auth/login" && req.method === "POST") {
-          return handleLogin(req, db, cfg);
+          return handleLogin(req, db, cfg, authLimiter);
+        }
+        if (path === "/api/v1/auth/break-glass" && req.method === "POST") {
+          return handleBreakGlass(req, db, cfg, authLimiter);
+        }
+        if (path === "/api/v1/auth/totp/enroll" && req.method === "POST") {
+          return handleTotpEnroll(req, db, cfg, totpPending);
+        }
+        if (path === "/api/v1/auth/totp/confirm" && req.method === "POST") {
+          return handleTotpConfirm(req, db, cfg, totpPending);
+        }
+        if (path === "/api/v1/auth/totp/disable" && req.method === "POST") {
+          return handleTotpDisable(req, db, cfg);
         }
         if (path === "/api/v1/auth/logout" && req.method === "POST") {
           return handleLogout(req, db, cfg);

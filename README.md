@@ -39,14 +39,16 @@ hashes, retention coverage) — the 17a-4(f)(2)(ii) automatic verification.
 | `TALLY_DATA_KEY` | — | 32-byte field-encryption key (64-char hex or base64) |
 | `TALLY_IDLE_TIMEOUT_MS` | `900000` (15 min) | session idle timeout (H-T3) |
 | `TALLY_ABSOLUTE_MAX_MS` | `43200000` (12 h) | absolute session lifetime |
+| `TALLY_AUTH_RATE_LIMIT` | `20` | auth attempts (login + break-glass) per IP per minute; 429 + `Retry-After` + `auth.rate_limited` audit row past the limit |
 | `TALLY_TLS_CERT` / `TALLY_TLS_KEY` | — | TLS cert/key; plain HTTP refuses to start without these unless `TALLY_ALLOW_INSECURE=1` |
 | `TALLY_ALLOW_INSECURE` | unset | dev-only flag permitting plain HTTP |
 
-## API (Phase 0–9 surface)
+## API (Phase 0–10 surface)
 
 Base: `/api/v1`. Errors: `{ error: { code, message } }` with stable machine
 codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
-`invalid_credentials`, `account_locked`, `not_found`, `unbalanced`,
+`invalid_credentials`, `account_locked`, `totp_required`, `totp_invalid`,
+`rate_limited`, `not_found`, `unbalanced`,
 `period_closed`, `already_reversed`, `in_use`, `overlap`, `no_open_period`,
 `retained`, `corrupt`, `over_applied`, `not_draft`, `not_posted`,
 `already_posted`, `already_void`, `void_blocked`,
@@ -55,15 +57,33 @@ codes (`unauthorized`, `session_expired`, `forbidden`, `validation`,
 `already_closed`, `already_cancelled`).
 
 ```
-POST /api/v1/auth/login { email, password } -> { token, expires_at, must_change_password }
+POST /api/v1/auth/login { email, password, totp_code? } -> { token, expires_at, must_change_password, mfa_enrollment_required }
+     MFA-enforced account + no code -> 401 totp_required, NO session issued;
+     wrong code -> 401 totp_invalid. Rate-limited: 20/min/IP -> 429 rate_limited
+POST /api/v1/auth/break-glass { email, password, justification, totp_code? } -> { token, expires_at, break_glass:true, break_glass_event_id }
+     admin role only (403 otherwise); justification >= 20 chars (400 otherwise);
+     1-hour absolute session flagged break_glass; rate-limited like login.
+     An MFA-enrolled admin must still supply a valid code — break-glass is
+     supervised emergency access, not a backdoor.
+POST /api/v1/auth/totp/enroll                  (Bearer) -> { secret, otpauth_uri }
+     returns a 160-bit base32 secret + otpauth:// URI; NOTHING is stored until
+     confirm (pending secret lives in server memory only, 10-min expiry)
+POST /api/v1/auth/totp/confirm { code, secret? }  (Bearer) -> { mfa_enabled:true }
+     verifies the code (±1 step, 30s), then sets totp_secret + mfa_required=1
+POST /api/v1/auth/totp/disable { password }    (Bearer) -> { mfa_enabled:false }
+     password re-check; clears totp_secret + mfa_required
 POST /api/v1/auth/logout                        (Bearer)
-GET  /api/v1/auth/me                            (Bearer)
+GET  /api/v1/auth/me                            (Bearer; includes mfa_enabled + break_glass flags; never totp_secret/pw_hash)
 GET  /api/v1/compliance/audit-log               (Bearer; roles with audit:read)
      ?action= &entity_type= &actor_id= &since= &until= &page= &per_page= &verify=1
 GET  /api/v1/compliance/retention-report        (Bearer; audit:read)
 GET  /api/v1/compliance/verify                  (Bearer; audit:read; storage verification)
 GET  /api/v1/compliance/export                  (Bearer; audit:read)
      ?entity_type=audit_log|documents|journal_entries &entity_id= &format=json|csv
+GET  /api/v1/compliance/break-glass             (Bearer; audit:read; ?status=unreviewed|reviewed|all, default unreviewed)
+     dashboard alert: unreviewed break-glass events (justification, token-hash prefix, timestamps)
+POST /api/v1/compliance/break-glass/:id/review  (Bearer; admin role OR supervisory principal)
+     marks the event reviewed; audited as auth.break_glass_reviewed; events are never deleted
 GET  /api/v1/documents                          (Bearer; documents:read; ?doc_type= &page= &per_page=)
 POST /api/v1/documents                          (Bearer; documents:write)
      JSON { title, doc_type, mime_type?, content_base64 }
@@ -174,6 +194,35 @@ Auth: argon2id passwords (≥12 chars, common-password screen), failed-login
 lockout with exponential backoff, bearer sessions stored as sha256 hashes
 (the raw token is shown once, at login), 15-minute sliding idle timeout and
 12-hour absolute max enforced server-side on every request.
+
+Hardening (Phase 10): TOTP MFA (RFC 6238, zero-dep: base32, HMAC-SHA1,
+30s step, ±1 window, constant-time compare) — enroll → confirm → login
+with code; password-only login for an MFA-enforced account returns 401
+`totp_required` and issues no session. MFA policy: `roles.mfa_required`
+is seeded for `admin` + `auditor`; enforcement is per-user
+(`users.mfa_required` + `totp_secret`). A role-required user with no
+enrolled secret is NOT locked out — login succeeds and reports
+`mfa_enrollment_required` — because locking out an account that has no
+secret anywhere would brick a fresh install with no recovery path; once
+a secret exists, a code is mandatory. TOTP secrets and codes never
+appear in audit rows (flags and token-hash prefixes only).
+Break-glass: admin-only emergency login with a ≥20-char justification,
+1-hour flagged session, a `break_glass_events` row, an
+`auth.break_glass` audit row, and a dashboard alert until a principal
+or admin reviews it. Backup: `tally backup --out <file>` (VACUUM INTO
+snapshot, AES-256-GCM with `TALLY_DATA_KEY`, `TALLYBK1` magic header),
+`tally restore --in <file> --db <path>` (refuses non-empty targets
+without `--force`), `tally backup --verify` (restore to temp, run
+`verifyAll` + trial balance on both, exit 1 on mismatch).
+Security pass: per-IP rate limiting on login + break-glass
+(`TALLY_AUTH_RATE_LIMIT`, default 20/min, 429 + `Retry-After` +
+`auth.rate_limited` audit); default-deny route review — every
+`/api/v1` route requires auth except login, break-glass, and `/health`,
+unknown routes return the 404 envelope; `package.json` carries zero
+dependencies and zero devDependencies (asserted by test).
+Explicitly OUT of Phase 10 (user decision 2026-10-27, post-ship
+follow-up): company tax-ID encryption — tax IDs remain in clear, as
+documented in the Phase 7/8 notes above.
 
 RBAC: least-privilege roles `admin`, `accountant`, `ap_clerk`, `sales`, `hr`,
 `auditor`, `viewer`; default-deny; `auditor` is read-only everywhere.
@@ -376,7 +425,10 @@ custom chart drops them).
 src/server.ts      HTTP API (Bun.serve)
 src/db.ts          SQLite open + migrations
 src/crypto.ts      AES-256-GCM field/byte encryption, sha256 helpers
-src/auth.ts        passwords, lockout, sessions
+src/auth.ts        passwords, lockout, sessions, TOTP gate, break-glass
+src/totp.ts        zero-dep RFC 6238 TOTP (base32, HMAC-SHA1, ±1 window)
+src/ratelimit.ts   in-memory per-IP auth rate limiter (per server instance)
+src/backup.ts      encrypted backup / restore / trial-balance verification
 src/rbac.ts        permission evaluation (permissions are seeded data)
 src/audit.ts       hash-chained append-only log + chain verification
 src/middleware.ts  JSON/errors, auth+RBAC wrappers, audited-mutation helper
@@ -401,22 +453,25 @@ src/retention.ts   retention engine: schedules, enforcement, coverage report
 src/compliance.ts  tally verify + compliance export (JSON/CSV)
 src/seed.ts        roles, RBAC matrix, admin user, retention policies,
                    default chart of accounts, current-year fiscal period
-src/cli.ts         `tally serve|seed|migrate|verify`
+src/cli.ts         `tally serve|seed|migrate|verify|backup|restore`
 migrations/        ordered SQL migrations (tracked in schema_migrations)
 tests/             bun test suite
 ```
 
-## Compliance map (Phase 0–9)
+## Compliance map (Phase 0–10)
 
-H-T1 unique user IDs · H-T3 automatic logoff · H-T4 encryption ·
-H-T5 audit controls · H-T6 (ledger) · H-T7 person authentication ·
+H-T1 unique user IDs · H-T2 MFA (TOTP, RFC 6238) · H-T3 automatic logoff ·
+H-T4 encryption · H-T5 audit controls · H-T6 (ledger) · H-T7 person
+authentication (TOTP gate + break-glass supervision) · H-A4 break-glass
+emergency access (justified, flagged, reviewed) ·
 H-A2 access management · H-A3 password management · H-A5 6y documentation
 retention · F-R1 books/records substrate · F-R2 format/media · F-R3
 immutability + WORM path · F-R4 automatic verification, export/download,
 pinned report reproduction (sha256) ·
 F-R7 retention periods · F-R8 customer account information (4512 field
 set + completeness validation) · F-R9 written complaints records ·
-F-R10 AI-agent comms as retention records (forward-looking: logged with
+F-R5 break-glass + encrypted backup/restore with trial-balance
+verification · F-R10 AI-agent comms as retention records (forward-looking: logged with
 origin, flagged, retained — no agent exists) · F-S1 principal review of
 correspondence, evidenced in writing · F-S2 complaint capture/
 acknowledge/respond · F-S3 supervisory personnel documentation, no

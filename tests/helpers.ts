@@ -31,7 +31,14 @@ export async function makeTestEnv(overrides: Partial<SessionConfig> = {}): Promi
   const dbPath = join(dir, "test.db");
   const db = openDb(dbPath);
   await seed(db);
-  const cfg: SessionConfig = { ...sessionConfigFromEnv(), ...overrides };
+  // Phase 10: test servers get a high auth rate limit by default so
+  // ordinary login-heavy suites never trip the 20/min production
+  // limiter; a dedicated rate-limit test passes a low override.
+  const cfg: SessionConfig = {
+    ...sessionConfigFromEnv(),
+    authRateLimitPerMinute: 1000,
+    ...overrides,
+  };
   const server = createServer(db, cfg, { port: 0 });
   const base = `http://127.0.0.1:${server.port}`;
   return {

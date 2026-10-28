@@ -144,6 +144,11 @@ export async function seed(db: Database): Promise<void> {
     for (const roleName of Object.keys(PERMISSION_MATRIX)) {
       db.query("INSERT OR IGNORE INTO roles (name) VALUES (?)").run(roleName);
     }
+    // Phase 10: admin + auditor are MFA-required roles (roles.mfa_required,
+    // migration 011). Enforcement is per-user once a secret exists — see
+    // auth.mfaEnforced — so seeding the flag never locks out an account
+    // that has not enrolled yet.
+    db.query("UPDATE roles SET mfa_required = 1 WHERE name IN ('admin', 'auditor')").run();
     const roleId = (name: string) =>
       (db.query("SELECT id FROM roles WHERE name = ?").get(name) as { id: number }).id;
     for (const [roleName, resources] of Object.entries(PERMISSION_MATRIX)) {

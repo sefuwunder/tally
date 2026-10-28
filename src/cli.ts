@@ -1,11 +1,15 @@
-// Tally ERP — CLI: `tally serve|seed|migrate|verify`
-// backup arrives in Phase 10 (roadmap).
+// Tally ERP — CLI: `tally serve|seed|migrate|verify|backup|restore`
+// Backup/restore/verify arrived in Phase 10 (F-R5).
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDb } from "./db";
 import { seed } from "./seed";
 import { createServer, TALLY_VERSION } from "./server";
 import { sessionConfigFromEnv } from "./auth";
 import { verifyAll } from "./compliance";
+import { createBackup, restoreBackup, verifyBackupAgainst, BackupError } from "./backup";
 
 function usage(): never {
   console.error(`tally v${TALLY_VERSION}
@@ -14,8 +18,22 @@ usage:
   tally seed                 seed roles, permissions, admin user, retention policies
   tally migrate              run pending DB migrations only
   tally verify               verify storage processes: audit chain, document
-                             hashes, retention coverage (17a-4(f)(2)(ii)); exit 1 on failure`);
+                             hashes, retention coverage (17a-4(f)(2)(ii)); exit 1 on failure
+  tally backup --out <file> [--verify] [--db <path>]
+                             snapshot the DB (VACUUM INTO) + AES-256-GCM encrypt
+                             with TALLY_DATA_KEY; --verify restores to a temp
+                             DB and proves trial balances identical (exit 1
+                             on mismatch). With --verify and no --out, the
+                             backup lives only in a temp file.
+  tally restore --in <file> --db <path> [--force]
+                             decrypt + write the DB; refuses to overwrite a
+                             non-empty existing DB unless --force`);
   process.exit(2);
+}
+
+function flagValue(rest: string[], name: string): string | null {
+  const i = rest.indexOf(name);
+  return i >= 0 ? (rest[i + 1] ?? null) : null;
 }
 
 async function main(): Promise<void> {
@@ -58,6 +76,80 @@ async function main(): Promise<void> {
     );
     db.close();
     process.exit(report.ok ? 0 : 1);
+  }
+
+  if (cmd === "backup") {
+    const out = flagValue(rest, "--out");
+    const dbOverride = flagValue(rest, "--db");
+    const doVerify = rest.includes("--verify");
+    let outPath = out;
+    let tempDir: string | null = null;
+    if (!outPath && !doVerify) {
+      console.error("tally backup requires --out <file> (or --verify for a temp-only check)");
+      process.exit(2);
+    }
+    if (!outPath) {
+      tempDir = mkdtempSync(join(tmpdir(), "tally-backup-cli-"));
+      outPath = join(tempDir, "tally.tallybk");
+    }
+    try {
+      const db = openDb(dbOverride ?? dbPath);
+      try {
+        const r = await createBackup(db, outPath);
+        console.log(`backup written: ${outPath} (${r.bytes} bytes, encrypted)`);
+        if (doVerify) {
+          const v = await verifyBackupAgainst(db, outPath);
+          console.log(
+            `backup verify — trial balances identical: ${v.trial_balances_identical}, ` +
+              `restored storage verification: ${v.restored.verify.ok ? "OK" : "FAIL"}`,
+          );
+          for (const tb of v.original.trial_balances) {
+            console.log(
+              `  period ${tb.period_id}: debits ${tb.total_debits} credits ${tb.total_credits} balanced ${tb.balanced}`,
+            );
+          }
+          if (!v.ok) {
+            console.error("backup verification FAILED");
+            process.exit(1);
+          }
+          console.log("backup verify — OK");
+        }
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      if (e instanceof BackupError) {
+        console.error(`backup failed (${e.code}): ${e.message}`);
+      } else {
+        console.error(e);
+      }
+      process.exit(1);
+    } finally {
+      if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+    }
+    return;
+  }
+
+  if (cmd === "restore") {
+    const inFile = flagValue(rest, "--in");
+    const dbOverride = flagValue(rest, "--db");
+    const force = rest.includes("--force");
+    if (!inFile || !dbOverride) {
+      console.error("tally restore requires --in <file> --db <path> [--force]");
+      process.exit(2);
+    }
+    try {
+      const r = await restoreBackup(inFile, dbOverride, { force });
+      console.log(`restored ${dbOverride} (${r.bytes} bytes)`);
+    } catch (e) {
+      if (e instanceof BackupError) {
+        console.error(`restore failed (${e.code}): ${e.message}`);
+      } else {
+        console.error(e);
+      }
+      process.exit(1);
+    }
+    return;
   }
 
   if (cmd === "serve") {
