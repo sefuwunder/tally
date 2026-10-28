@@ -11,9 +11,9 @@
 
 import type { Database } from "bun:sqlite";
 import { Database as SqliteDatabase } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { checkpoint, openDb } from "./db";
 import { decryptBytes, encryptBytes } from "./crypto";
 import { listPeriods, trialBalance, type TrialBalance } from "./ledger";
@@ -92,6 +92,8 @@ export async function restoreBackup(
   for (const suffix of ["-wal", "-shm", "-journal"]) {
     rmSync(targetPath + suffix, { force: true });
   }
+  // Same fresh-install class as openDb: the target's parent may not exist yet.
+  mkdirSync(dirname(targetPath), { recursive: true });
   writeFileSync(targetPath, plain);
   return { bytes: plain.length };
 }

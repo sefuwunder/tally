@@ -3,7 +3,7 @@
 // Zero npm deps (bun:sqlite is built in).
 
 import { Database } from "bun:sqlite";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,6 +43,10 @@ export function runMigrations(db: Database): void {
 
 /** Open (creating) the SQLite file, enable WAL + FKs, run pending migrations. */
 export function openDb(path: string): Database {
+  // Fresh clones have no data/ dir (it is gitignored), and bun:sqlite
+  // cannot create a file whose parent directory is missing — so create
+  // the parent first. ":memory:" resolves to "." here, a no-op.
+  mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");

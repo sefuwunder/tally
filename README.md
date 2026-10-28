@@ -13,7 +13,15 @@ database file, REST JSON API.
 
 ## Quick start
 
+Prerequisite: [Bun](https://bun.sh) (no `npm install` — zero dependencies).
+From a fresh clone, no setup beyond the three commands below: the server
+creates the database directory itself on first run.
+
 ```sh
+# 0. clone and enter the repo
+git clone https://github.com/sefuwunder/tally.git
+cd tally
+
 # 1. set the field-encryption key (32 bytes, hex or base64; never commit it)
 export TALLY_DATA_KEY=$(openssl rand -hex 32)
 

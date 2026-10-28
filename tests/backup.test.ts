@@ -58,6 +58,22 @@ describe("backup / restore", () => {
     expect(v.ok).toBe(true);
   });
 
+  test("restore creates a missing target parent directory (fresh-install class)", async () => {
+    seedLedgerActivity();
+    const dir = mkdtempSync(join(tmpdir(), "tally-backup-nested-"));
+    const backupPath = join(dir, "tally.bk");
+    await createBackup(env.db, backupPath);
+    const nestedTarget = join(dir, "fresh", "sub", "tally.db");
+    await restoreBackup(backupPath, nestedTarget);
+    expect(existsSync(nestedTarget)).toBe(true);
+    const restored = openDb(nestedTarget);
+    try {
+      expect(trialBalanceSummaries(restored)).toEqual(trialBalanceSummaries(env.db));
+    } finally {
+      restored.close();
+    }
+  });
+
   test("tampered backup file rejected (magic + GCM authentication)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tally-bk-"));
     const backupPath = join(dir, "tally.tallybk");
